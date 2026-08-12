@@ -39,6 +39,7 @@ PATH_KEYS = {
 PATCH_PATH_RE = re.compile(r"^\*\*\* (?:Add|Delete|Update) File:\s*(.+?)\s*$", re.MULTILINE)
 PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to:\s*(.+?)\s*$", re.MULTILINE)
 WINDOWS_ABSOLUTE_RE = re.compile(r"(?<![\w])([A-Za-z]:[\\/][^\s\"'`|;&<>]+)")
+POSIX_ABSOLUTE_RE = re.compile(r"(?<![\w])(/[^\s\"'`|;&<>]+)")
 
 
 def git_root(path: Path) -> Path | None:
@@ -104,6 +105,7 @@ def candidate_paths(tool_name: str, tool_input: Any) -> list[str]:
         values.extend(PATCH_MOVE_RE.findall(command))
     if command and MUTATING_COMMAND_RE.search(command):
         values.extend(WINDOWS_ABSOLUTE_RE.findall(command))
+        values.extend(POSIX_ABSOLUTE_RE.findall(command))
     return list(dict.fromkeys(value.strip().strip('"\'') for value in values if value.strip()))
 
 
