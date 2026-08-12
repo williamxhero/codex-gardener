@@ -4,8 +4,11 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -93,6 +96,33 @@ class EffectivenessTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=12) as pool:
             self.assertTrue(all(pool.map(write, range(80))))
         self.assertEqual(len(self.records()), 80)
+
+    def test_same_process_writers_enter_file_lock_one_at_a_time(self) -> None:
+        gate = threading.Lock()
+        active = 0
+
+        @contextmanager
+        def exclusive_probe(_path):
+            nonlocal active
+            with gate:
+                if active:
+                    raise TimeoutError("simulated same-process lock contention")
+                active += 1
+            try:
+                time.sleep(0.003)
+                yield
+            finally:
+                with gate:
+                    active -= 1
+
+        def write(_: int) -> bool:
+            return effectiveness.log_event(
+                "session_start", root=self.root, session="same-process", project="same-project"
+            )
+
+        with patch.object(effectiveness, "file_lock", exclusive_probe):
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                self.assertTrue(all(pool.map(write, range(40))))
 
     def test_rotation_bounds_files_and_retention(self) -> None:
         with patch.object(effectiveness, "MAX_LOG_BYTES", 180), patch.object(effectiveness, "MAX_BACKUPS", 2):

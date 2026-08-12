@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import os
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ MAX_LOG_BYTES = 1024 * 1024
 MAX_BACKUPS = 4
 RETENTION_DAYS = 90
 OPT_OUT_ENV = "CODEX_GARDENER_EFFECTIVENESS_LOG"
+PROCESS_WRITE_LOCK = threading.Lock()
 
 EVENT_FIELDS: dict[str, set[str]] = {
     "session_start": {"session", "project"},
@@ -206,12 +208,13 @@ def log_event(event: str, *, root: Path | None = None, **fields: Any) -> bool:
         encoded = rendered.encode("utf-8")
         path = log_path(root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with file_lock(path):
-            _rotate(path, len(encoded))
-            with path.open("ab") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
+        with PROCESS_WRITE_LOCK:
+            with file_lock(path):
+                _rotate(path, len(encoded))
+                with path.open("ab") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
         return True
     except (OSError, TimeoutError, TypeError, ValueError):
         return False
