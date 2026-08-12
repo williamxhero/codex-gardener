@@ -10,6 +10,6 @@ Include the affected version, operating system, Codex version, reproduction step
 
 Codex Gardener runs local Python commands at Codex lifecycle boundaries. Review `hooks/hooks.json` and both scripts before trusting the hooks through `/hooks`. The project-boundary hook is deliberately conservative but cannot parse every shell, tool, path, symlink, or nested repository arrangement. It is a guardrail, not a security sandbox.
 
-Knowledge candidates are untrusted input. Review evidence before promotion, keep secrets out of summaries, inspect every diff, and preserve normal repository review and CI controls. Install only from a repository and Git ref you trust.
+Knowledge candidates are untrusted input. Review evidence and scope before promotion, keep secrets out of summaries, inspect every diff, and preserve normal repository review and CI controls. Global promotion has wider impact and must remain confirmation-gated. Project fingerprints are diversity signals, not security identities or proof of project independence. Install only from a repository and Git ref you trust.
 
 This project is community-maintained and is not an official OpenAI product.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Knowledge Curator"
-  short_description: "Promote proven repository knowledge"
-  default_prompt: "Use $knowledge-curator to curate and promote accumulated repository lessons."
+  short_description: "Promote knowledge at the right scope"
+  default_prompt: "Use $knowledge-curator to curate repository and global lessons at the narrowest valid scope."

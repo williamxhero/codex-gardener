@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
+KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
 CORRECTION_RE = re.compile(
     r"(?:不对|错了|纠正|我说的是|你忘了|没有按|不是.{0,20}而是|"
@@ -297,12 +298,26 @@ def tool_mutates(tool_name: str, command: str) -> bool:
     )
 
 
-def learning_dir(repo: Path) -> Path:
+def normalize_knowledge_scope(value: Any) -> str:
+    scope = str(value or "repository").casefold()
+    if scope not in KNOWLEDGE_SCOPES:
+        raise ValueError(f"knowledge scope must be one of: {', '.join(sorted(KNOWLEDGE_SCOPES))}")
+    return scope
+
+
+def stored_knowledge_scope(value: Any) -> str:
+    scope = str(value or "repository").casefold()
+    return scope if scope in KNOWLEDGE_SCOPES else "repository"
+
+
+def learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path:
+    if normalize_knowledge_scope(knowledge_scope) == "global":
+        return codex_home() / "codex-gardener-global-learning"
     return repo / ".codex" / "learning"
 
 
-def ensure_learning_dir(repo: Path) -> Path:
-    root = learning_dir(repo)
+def ensure_learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path:
+    root = learning_dir(repo, knowledge_scope)
     root.mkdir(parents=True, exist_ok=True)
     ignore = root / ".gitignore"
     required = ["inbox.jsonl", "index.jsonl", "resolutions.jsonl"]
@@ -316,6 +331,16 @@ def ensure_learning_dir(repo: Path) -> Path:
     return root
 
 
+def project_fingerprint(repo: Path) -> str:
+    root = repo_root(repo) or repo.resolve()
+    remote = run_git(root, ["config", "--get", "remote.origin.url"])
+    if remote:
+        identity = "remote\0" + remote.decode("utf-8", errors="replace").strip().casefold()
+    else:
+        identity = "path\0" + os.path.normcase(str(root.resolve()))
+    return sha256_text(identity)[:24]
+
+
 def normalize_lesson(value: str) -> str:
     return " ".join(value.strip().casefold().split())
 
@@ -326,6 +351,7 @@ def candidate_fingerprint(scope: str, lesson: str, target: str) -> str:
 
 def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
     repo = Path(args.repo).resolve()
+    knowledge_scope = normalize_knowledge_scope(getattr(args, "knowledge_scope", "repository"))
     target = args.target.casefold()
     if target not in TARGETS:
         raise ValueError(f"target must be one of: {', '.join(sorted(TARGETS))}")
@@ -338,6 +364,8 @@ def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
         "id": str(uuid.uuid4()),
         "fingerprint": fingerprint,
         "session_id": args.session_id,
+        "knowledge_scope": knowledge_scope,
+        "project_fingerprint": project_fingerprint(repo),
         "scope": args.scope.strip(),
         "lesson": args.lesson.strip(),
         "evidence_summary": args.evidence.strip(),
@@ -345,14 +373,24 @@ def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
         "confidence": confidence,
         "created_at": utc_now(),
     }
-    append_jsonl(ensure_learning_dir(repo) / "inbox.jsonl", record)
+    append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "inbox.jsonl", record)
     mark_review_complete(args.session_id)
     return record
 
 
-def aggregate_candidates(repo: Path) -> list[dict[str, Any]]:
-    records = read_jsonl(learning_dir(repo) / "inbox.jsonl")
-    resolutions = read_jsonl(learning_dir(repo) / "resolutions.jsonl")
+def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> list[dict[str, Any]]:
+    knowledge_scope = normalize_knowledge_scope(knowledge_scope)
+    root = learning_dir(repo, knowledge_scope)
+    records = [
+        record
+        for record in read_jsonl(root / "inbox.jsonl")
+        if stored_knowledge_scope(record.get("knowledge_scope")) == knowledge_scope
+    ]
+    resolutions = [
+        resolution
+        for resolution in read_jsonl(root / "resolutions.jsonl")
+        if stored_knowledge_scope(resolution.get("knowledge_scope")) == knowledge_scope
+    ]
     latest_resolution = {str(item.get("fingerprint")): item for item in resolutions if item.get("fingerprint")}
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -369,9 +407,22 @@ def aggregate_candidates(repo: Path) -> list[dict[str, Any]]:
                 by_session[session] = item
         unique = list(by_session.values())
         confidence = sum(float(item.get("confidence") or 0) for item in unique) / len(unique)
+        projects = sorted(
+            {
+                str(item.get("project_fingerprint"))
+                for item in unique
+                if item.get("project_fingerprint")
+            }
+        )
         status = "candidate"
-        if len(unique) >= 3 and confidence >= 0.85:
+        if (
+            len(unique) >= 3
+            and confidence >= 0.85
+            and (knowledge_scope == "repository" or len(projects) >= 2)
+        ):
             status = "promotable"
+        elif knowledge_scope == "global" and len(unique) >= 3 and confidence >= 0.85:
+            status = "proposed"
         elif len(unique) >= 2:
             status = "confirmed"
         exemplar = max(unique, key=lambda item: str(item.get("created_at") or ""))
@@ -381,19 +432,23 @@ def aggregate_candidates(repo: Path) -> list[dict[str, Any]]:
                 "status": status,
                 "occurrences": len(unique),
                 "confidence": round(confidence, 4),
+                "knowledge_scope": knowledge_scope,
                 "scope": exemplar.get("scope"),
                 "lesson": exemplar.get("lesson"),
                 "recommended_target": exemplar.get("recommended_target"),
                 "evidence": [item.get("evidence_summary") for item in unique if item.get("evidence_summary")],
                 "session_ids": sorted(by_session),
+                "project_fingerprints": projects,
+                "project_count": len(projects),
                 "resolution": latest_resolution.get(fingerprint),
             }
         )
     return sorted(result, key=lambda item: (-item["occurrences"], item["fingerprint"]))
 
 
-def update_index(repo: Path, resolution: dict[str, Any]) -> None:
-    root = ensure_learning_dir(repo)
+def update_index(repo: Path, resolution: dict[str, Any], knowledge_scope: str = "repository") -> None:
+    knowledge_scope = normalize_knowledge_scope(knowledge_scope)
+    root = ensure_learning_dir(repo, knowledge_scope)
     path = root / "index.jsonl"
     entries = read_jsonl(path)
     entries = [item for item in entries if item.get("fingerprint") != resolution["fingerprint"]]
@@ -401,6 +456,7 @@ def update_index(repo: Path, resolution: dict[str, Any]) -> None:
         {
             "schema_version": SCHEMA_VERSION,
             "fingerprint": resolution["fingerprint"],
+            "knowledge_scope": knowledge_scope,
             "summary": resolution["summary"],
             "keywords": resolution["keywords"],
             "target_path": resolution["target_path"],
@@ -421,23 +477,33 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
     if args.status not in SAFE_RESOLUTION_STATUSES:
         raise ValueError(f"status must be one of: {', '.join(sorted(SAFE_RESOLUTION_STATUSES))}")
     repo = Path(args.repo).resolve()
+    knowledge_scope = normalize_knowledge_scope(getattr(args, "knowledge_scope", "repository"))
     resolution = {
         "schema_version": SCHEMA_VERSION,
         "fingerprint": args.fingerprint,
+        "knowledge_scope": knowledge_scope,
         "status": args.status,
         "summary": (args.summary or "").strip(),
         "keywords": sorted(set(args.keyword or [])),
         "target_path": (args.target_path or "").strip(),
         "created_at": utc_now(),
     }
-    append_jsonl(ensure_learning_dir(repo) / "resolutions.jsonl", resolution)
+    append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "resolutions.jsonl", resolution)
     if args.status == "promoted" and resolution["summary"] and resolution["target_path"]:
-        update_index(repo, resolution)
+        update_index(repo, resolution, knowledge_scope)
     return resolution
 
 
 def promoted_context(repo: Path, prompt: str) -> str | None:
-    entries = read_jsonl(learning_dir(repo) / "index.jsonl")
+    combined: dict[str, dict[str, Any]] = {}
+    for knowledge_scope in ("global", "repository"):
+        for raw_entry in read_jsonl(learning_dir(repo, knowledge_scope) / "index.jsonl"):
+            entry = dict(raw_entry)
+            entry["knowledge_scope"] = stored_knowledge_scope(entry.get("knowledge_scope"))
+            fingerprint = str(entry.get("fingerprint") or "")
+            if fingerprint:
+                combined[fingerprint] = entry
+    entries = list(combined.values())
     lowered = prompt.casefold()
     scored: list[tuple[int, dict[str, Any]]] = []
     for entry in entries:
@@ -448,9 +514,12 @@ def promoted_context(repo: Path, prompt: str) -> str | None:
     if not scored:
         return None
     scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("promoted_at") or "")), reverse=False)
-    lines = ["Codex Gardener found relevant promoted repository knowledge:"]
+    lines = ["Codex Gardener found relevant promoted knowledge:"]
     for _, entry in scored[:3]:
-        lines.append(f"- {entry.get('summary')} (source: {entry.get('target_path')})")
+        lines.append(
+            f"- [{entry.get('knowledge_scope')}] {entry.get('summary')} "
+            f"(source: {entry.get('target_path')})"
+        )
     return "\n".join(lines)
 
 
@@ -541,18 +610,17 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
     elif CORRECTION_RE.search(prompt):
         state["correction_signal"] = True
     save_state(path, state)
-    root_value = state.get("repo_root")
-    if root_value:
-        context = promoted_context(Path(root_value), prompt)
-        if context:
-            emit_json(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
-                        "additionalContext": context,
-                    }
+    lookup_root = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
+    context = promoted_context(lookup_root, prompt)
+    if context:
+        emit_json(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
                 }
-            )
+            }
+        )
 
 
 def handle_post_tool(payload: dict[str, Any]) -> None:
@@ -592,7 +660,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
     repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
     reason = (
-        "Use $gardener-capture now to review this completed task for reusable repository knowledge. "
+        "Use $gardener-capture now to review this completed task for reusable knowledge at the right scope. "
         f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
         "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
         "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
@@ -649,6 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
     record = sub.add_parser("record")
     record.add_argument("--repo", required=True)
     record.add_argument("--session-id", required=True)
+    record.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
     record.add_argument("--scope", required=True)
     record.add_argument("--lesson", required=True)
     record.add_argument("--evidence", required=True)
@@ -657,10 +726,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     groups = sub.add_parser("groups")
     groups.add_argument("--repo", required=True)
+    groups.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
 
     resolve = sub.add_parser("resolve")
     resolve.add_argument("--repo", required=True)
     resolve.add_argument("--fingerprint", required=True)
+    resolve.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
     resolve.add_argument("--status", required=True, choices=sorted(SAFE_RESOLUTION_STATUSES))
     resolve.add_argument("--summary")
     resolve.add_argument("--target-path")
@@ -687,7 +758,12 @@ def main() -> int:
         if args.command == "record":
             emit_json(record_candidate(args))
         elif args.command == "groups":
-            emit_json({"groups": aggregate_candidates(Path(args.repo).resolve())})
+            emit_json(
+                {
+                    "knowledge_scope": args.knowledge_scope,
+                    "groups": aggregate_candidates(Path(args.repo).resolve(), args.knowledge_scope),
+                }
+            )
         elif args.command == "resolve":
             emit_json(resolve_candidate(args))
         elif args.command == "review-complete":

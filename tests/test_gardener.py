@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -28,8 +29,15 @@ class GardenerTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "repo"
         self.root.mkdir()
+        self.other = Path(self.temp.name) / "other-repo"
+        self.other.mkdir()
         self.data = Path(self.temp.name) / "plugin-data"
-        self.env = patch.dict(os.environ, {"CODEX_GARDENER_DATA": str(self.data)}, clear=False)
+        self.codex_home = Path(self.temp.name) / "codex-home"
+        self.env = patch.dict(
+            os.environ,
+            {"CODEX_GARDENER_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+            clear=False,
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -56,6 +64,33 @@ class GardenerTest(unittest.TestCase):
         (self.root / "tracked.txt").write_text("before\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.root), "add", "tracked.txt"], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "baseline"], check=True)
+
+    def candidate_args(self, *, repo: Path | None = None, **extra) -> argparse.Namespace:
+        values = {
+            "repo": str(repo or self.root),
+            "session_id": "session-1",
+            "knowledge_scope": "repository",
+            "scope": "tests",
+            "lesson": "Run the contract test before changing the parser.",
+            "evidence": "Observed in a completed task.",
+            "target": "test",
+            "confidence": 0.9,
+        }
+        values.update(extra)
+        return argparse.Namespace(**values)
+
+    def resolution_args(self, **extra) -> argparse.Namespace:
+        values = {
+            "repo": str(self.root),
+            "fingerprint": "abc123",
+            "knowledge_scope": "repository",
+            "status": "promoted",
+            "summary": "Run parser contract tests before parser changes.",
+            "target_path": "AGENTS.md",
+            "keyword": ["parser", "contract"],
+        }
+        values.update(extra)
+        return argparse.Namespace(**values)
 
     def test_stop_without_signal_continues(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
@@ -139,14 +174,9 @@ class GardenerTest(unittest.TestCase):
 
     def test_candidates_dedupe_sessions_and_promote_at_three(self) -> None:
         for session in ("s1", "s1", "s2", "s3"):
-            args = argparse.Namespace(
-                repo=str(self.root),
+            args = self.candidate_args(
                 session_id=session,
-                scope="tests",
-                lesson="Run the contract test before changing the parser.",
                 evidence=f"Observed in {session}",
-                target="test",
-                confidence=0.9,
             )
             gardener.record_candidate(args)
         groups = gardener.aggregate_candidates(self.root)
@@ -160,8 +190,7 @@ class GardenerTest(unittest.TestCase):
     def test_concurrent_candidate_appends_remain_valid_jsonl(self) -> None:
         def write(index: int) -> None:
             gardener.record_candidate(
-                argparse.Namespace(
-                    repo=str(self.root),
+                self.candidate_args(
                     session_id=f"parallel-{index}",
                     scope="parallel",
                     lesson=f"Independent lesson {index}",
@@ -178,18 +207,286 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(len({record["id"] for record in records}), 24)
 
     def test_resolution_builds_retrieval_index(self) -> None:
-        args = argparse.Namespace(
-            repo=str(self.root),
-            fingerprint="abc123",
-            status="promoted",
-            summary="Run parser contract tests before parser changes.",
-            target_path="AGENTS.md",
-            keyword=["parser", "contract"],
-        )
+        args = self.resolution_args()
         gardener.resolve_candidate(args)
         context = gardener.promoted_context(self.root, "Please update the parser contract")
         self.assertIsNotNone(context)
         self.assertIn("AGENTS.md", context)
+
+    def test_legacy_candidate_defaults_to_repository_scope(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "id": "legacy",
+            "fingerprint": "legacy-fingerprint",
+            "session_id": "legacy-session",
+            "scope": "parser",
+            "lesson": "Legacy lessons remain local.",
+            "evidence_summary": "Stored before scope tiers existed.",
+            "recommended_target": "docs",
+            "confidence": 0.8,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        gardener.append_jsonl(gardener.ensure_learning_dir(self.root) / "inbox.jsonl", legacy)
+        groups = gardener.aggregate_candidates(self.root)
+        self.assertEqual(groups[0]["knowledge_scope"], "repository")
+        self.assertEqual(groups[0]["fingerprint"], "legacy-fingerprint")
+        self.assertEqual(gardener.aggregate_candidates(self.root, "global"), [])
+
+        gardener.append_jsonl(
+            gardener.ensure_learning_dir(self.root) / "index.jsonl",
+            {
+                "schema_version": 1,
+                "fingerprint": "legacy-index",
+                "summary": "Legacy promoted context stays local.",
+                "keywords": ["legacy context"],
+                "target_path": "AGENTS.md",
+                "promoted_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.assertIn("[repository]", gardener.promoted_context(self.root, "legacy context") or "")
+        self.assertIsNone(gardener.promoted_context(self.other, "legacy context"))
+
+    def test_records_repository_and_global_candidates_in_separate_stores(self) -> None:
+        repository = gardener.record_candidate(self.candidate_args(session_id="repo-session"))
+        global_record = gardener.record_candidate(
+            self.candidate_args(
+                session_id="global-session",
+                knowledge_scope="global",
+                lesson="Review diffs before declaring work complete.",
+                target="agents",
+            )
+        )
+        repository_records = gardener.read_jsonl(gardener.learning_dir(self.root) / "inbox.jsonl")
+        global_records = gardener.read_jsonl(gardener.learning_dir(self.root, "global") / "inbox.jsonl")
+        self.assertEqual(repository_records, [repository])
+        self.assertEqual(global_records, [global_record])
+        self.assertEqual(global_record["knowledge_scope"], "global")
+        self.assertEqual(len(global_record["project_fingerprint"]), 24)
+        self.assertNotIn(str(self.root), json.dumps(global_record))
+        self.assertTrue(str(gardener.learning_dir(self.root, "global")).startswith(str(self.codex_home)))
+        global_ignore = (gardener.learning_dir(self.root, "global") / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("inbox.jsonl", global_ignore)
+
+    def test_global_promotion_requires_sessions_from_two_projects(self) -> None:
+        for session in ("one", "two"):
+            gardener.record_candidate(
+                self.candidate_args(
+                    session_id=session,
+                    knowledge_scope="global",
+                    scope="completion",
+                    lesson="Review the final diff before completion.",
+                    target="agents",
+                )
+            )
+        confirmed = gardener.aggregate_candidates(self.root, "global")[0]
+        self.assertEqual(confirmed["status"], "confirmed")
+        self.assertEqual(confirmed["occurrences"], 2)
+
+        gardener.record_candidate(
+            self.candidate_args(
+                session_id="three",
+                knowledge_scope="global",
+                scope="completion",
+                lesson="Review the final diff before completion.",
+                target="agents",
+            )
+        )
+        same_project = gardener.aggregate_candidates(self.root, "global")[0]
+        self.assertEqual(same_project["status"], "proposed")
+        self.assertEqual(same_project["project_count"], 1)
+
+        gardener.record_candidate(
+            self.candidate_args(
+                repo=self.other,
+                session_id="four",
+                knowledge_scope="global",
+                scope="completion",
+                lesson="Review the final diff before completion.",
+                target="agents",
+            )
+        )
+        cross_project = gardener.aggregate_candidates(self.other, "global")[0]
+        self.assertEqual(cross_project["status"], "promotable")
+        self.assertEqual(cross_project["occurrences"], 4)
+        self.assertEqual(cross_project["project_count"], 2)
+
+    def test_global_evidence_below_confidence_remains_confirmed(self) -> None:
+        for session in ("one", "two", "three"):
+            gardener.record_candidate(
+                self.candidate_args(
+                    session_id=session,
+                    knowledge_scope="global",
+                    scope="completion",
+                    lesson="Review the final diff before completion.",
+                    target="agents",
+                    confidence=0.7,
+                )
+            )
+        group = gardener.aggregate_candidates(self.root, "global")[0]
+        self.assertEqual(group["status"], "confirmed")
+        self.assertEqual(group["occurrences"], 3)
+        self.assertEqual(group["confidence"], 0.7)
+
+    def test_global_retrieval_crosses_repositories_but_repository_retrieval_does_not(self) -> None:
+        gardener.resolve_candidate(
+            self.resolution_args(
+                knowledge_scope="global",
+                fingerprint="global-rule",
+                summary="Always inspect the final diff.",
+                target_path="~/.codex/AGENTS.md",
+                keyword=["final diff"],
+            )
+        )
+        gardener.resolve_candidate(
+            self.resolution_args(
+                fingerprint="local-rule",
+                summary="Run this repository's parser contract test.",
+                keyword=["parser contract"],
+            )
+        )
+        global_context = gardener.promoted_context(self.other, "Inspect the final diff")
+        local_context = gardener.promoted_context(self.other, "Run the parser contract")
+        self.assertIn("[global]", global_context or "")
+        self.assertIn("Always inspect the final diff.", global_context or "")
+        self.assertIsNone(local_context)
+
+        subprocess.run(["git", "init", "-q", str(self.other)], check=True)
+        hook_payload = self.payload(
+            session_id="other-session",
+            turn_id="other-turn",
+            cwd=str(self.other),
+            prompt="Inspect the final diff",
+        )
+        self.run_hook("SessionStart", hook_payload)
+        hook_context = self.run_hook("UserPromptSubmit", hook_payload)
+        additional = hook_context["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("[global]", additional)
+        self.assertIn("Always inspect the final diff.", additional)
+
+    def test_hook_retrieves_global_context_outside_git(self) -> None:
+        gardener.resolve_candidate(
+            self.resolution_args(
+                knowledge_scope="global",
+                fingerprint="global-non-git",
+                summary="Keep portable guidance available outside Git.",
+                target_path="~/.codex/AGENTS.md",
+                keyword=["portable guidance"],
+            )
+        )
+        outside = Path(self.temp.name) / "plain-directory"
+        outside.mkdir()
+        hook_payload = self.payload(
+            session_id="plain-session",
+            turn_id="plain-turn",
+            cwd=str(outside),
+            prompt="Use portable guidance",
+        )
+        self.run_hook("SessionStart", hook_payload)
+        context = self.run_hook("UserPromptSubmit", hook_payload)
+        additional = context["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("[global]", additional)
+        self.assertIn("outside Git", additional)
+
+    def test_combined_retrieval_deduplicates_and_prefers_repository_entry(self) -> None:
+        gardener.resolve_candidate(
+            self.resolution_args(
+                knowledge_scope="global",
+                fingerprint="shared",
+                summary="Global review guidance.",
+                target_path="~/.codex/AGENTS.md",
+                keyword=["review"],
+            )
+        )
+        gardener.resolve_candidate(
+            self.resolution_args(
+                fingerprint="shared",
+                summary="Repository-specific review guidance.",
+                keyword=["review"],
+            )
+        )
+        context = gardener.promoted_context(self.root, "Please review this") or ""
+        self.assertEqual(context.count("shared"), 0)
+        self.assertEqual(context.count("guidance"), 1)
+        self.assertIn("Repository-specific", context)
+        self.assertNotIn("Global review", context)
+
+    def test_cli_defaults_repository_and_supports_global_scope(self) -> None:
+        env = os.environ.copy()
+        repository_command = [
+            sys.executable,
+            str(SCRIPT),
+            "record",
+            "--repo",
+            str(self.root),
+            "--session-id",
+            "cli-repository",
+            "--scope",
+            "cli",
+            "--lesson",
+            "Keep legacy CLI storage local.",
+            "--evidence",
+            "CLI default exercised.",
+            "--target",
+            "docs",
+            "--confidence",
+            "0.8",
+        ]
+        repository = subprocess.run(repository_command, capture_output=True, text=True, check=True, env=env)
+        self.assertEqual(json.loads(repository.stdout)["knowledge_scope"], "repository")
+
+        global_command = repository_command.copy()
+        global_command[global_command.index("--session-id") + 1] = "cli-global"
+        global_command[global_command.index("--lesson") + 1] = "Keep portable CLI storage global."
+        global_command[3:3] = ["--knowledge-scope", "global"]
+        global_result = subprocess.run(global_command, capture_output=True, text=True, check=True, env=env)
+        self.assertEqual(json.loads(global_result.stdout)["knowledge_scope"], "global")
+
+        groups = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "groups",
+                "--repo",
+                str(self.root),
+                "--knowledge-scope",
+                "global",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        payload = json.loads(groups.stdout)
+        self.assertEqual(payload["knowledge_scope"], "global")
+        self.assertEqual(len(payload["groups"]), 1)
+        fingerprint = payload["groups"][0]["fingerprint"]
+        resolved = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "resolve",
+                "--repo",
+                str(self.root),
+                "--fingerprint",
+                fingerprint,
+                "--knowledge-scope",
+                "global",
+                "--status",
+                "promoted",
+                "--summary",
+                "Keep portable CLI storage global.",
+                "--target-path",
+                "~/.codex/AGENTS.md",
+                "--keyword",
+                "portable",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        self.assertEqual(json.loads(resolved.stdout)["knowledge_scope"], "global")
+        self.assertIn("Keep portable CLI storage global.", gardener.promoted_context(self.other, "portable") or "")
 
 
 if __name__ == "__main__":

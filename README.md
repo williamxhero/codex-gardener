@@ -1,8 +1,10 @@
 # Codex Gardener
 
-Codex Gardener turns lessons from completed Codex tasks into small, verified, repository-scoped knowledge. It captures candidates without changing promoted project artifacts, aggregates independent evidence over time, and helps curate proven lessons into concise `AGENTS.md` guidance, project Skills, regression tests, hooks, or documentation.
+Codex Gardener turns lessons from completed Codex tasks into small, verified knowledge at the right scope. Project-specific facts stay with one repository; genuinely portable principles and workflows can become available across all projects.
 
-It also includes an opt-in cross-project write guard. When a task attempts to write into a different Git repository, the guard points Codex to a bundled delegation workflow so the target project remains the implementation context.
+Capture and promotion are separate. The plugin records concise candidates first, accumulates independent evidence, then helps a curator challenge scope, conflicts, sensitivity, and target before anything becomes lasting guidance.
+
+It also includes an opt-in cross-project write guard. When a task attempts to write into another Git repository, the guard points Codex to a bundled delegation workflow so the target project remains the implementation context.
 
 > Codex Gardener is an independent community project. It is not an official OpenAI product.
 
@@ -16,14 +18,12 @@ The runtime and installer use only the Python standard library.
 
 ## Install from Git
 
-Add the public marketplace and install the plugin:
-
 ```bash
 codex plugin marketplace add williamxhero/codex-gardener
 codex plugin add codex-gardener@codex-gardener
 ```
 
-Start a new Codex task after installation. Run `/hooks`, inspect every command in `hooks/hooks.json`, and explicitly trust the hooks only if you are comfortable with their local behavior. Hooks remain opt-in; installing the plugin is not a substitute for reviewing them.
+Start a new Codex task after installation. Run `/hooks`, inspect every command in `hooks/hooks.json`, and explicitly trust the hooks only if you are comfortable with their local behavior. Hooks remain opt-in.
 
 ## Install from a clone
 
@@ -34,38 +34,80 @@ python install.py --dry-run
 python install.py
 ```
 
-On Linux or macOS, use `python3` when `python` is unavailable. The installer locates `codex`, verifies the checkout, safely reuses a matching local marketplace, installs `codex-gardener@codex-gardener`, and prints hook-trust and new-task guidance. It stops if the marketplace name already points elsewhere.
+Use `python3` when `python` is unavailable. The installer locates `codex`, validates the checkout, safely reuses a matching local marketplace, installs `codex-gardener@codex-gardener`, and prints hook-trust and new-task guidance. It stops if the marketplace name already points elsewhere.
 
-中文快速开始：执行上面的两条 `codex plugin` 命令，安装后新建任务；先运行 `/hooks` 检查命令，再决定是否信任并启用 hooks。
-
-## How it works
+## Architecture
 
 | Component | Role |
 | --- | --- |
-| `gardener.py` lifecycle hooks | Track bounded task signals, surface previously promoted context, and request at most one retrospective when useful. |
-| `$gardener-capture` | Review the completed task and append concise evidence candidates without editing promoted artifacts. |
-| `$knowledge-curator` | De-duplicate and challenge candidates, then promote only sufficiently supported repository knowledge. |
-| `project_boundary.py` PreToolUse hook | Conservatively deny detected writes from one Git repository into another. |
+| `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
+| `$gardener-capture` | Classify each lesson as repository or global and append concise evidence without editing promoted artifacts. |
+| `$knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
+| `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
 | `$cross-project-delegation` | Move authorized implementation into a task or agent context owned by the target repository. |
 
-The learning model deliberately separates observation from promotion:
+### Two knowledge scopes
 
-1. One independent task produces a **candidate**.
-2. Two independent tasks make it **confirmed**.
-3. Three or more independent tasks with aggregate confidence of at least `0.85` make it **eligible**, not automatically correct.
-4. The curator checks current code, tests, docs, conflicts, scope, and sensitivity before applying safe changes. Risky changes remain proposals requiring confirmation.
+- `repository` is the default. Use it for language, framework, architecture, layout, team, deployment, data-contract, and other project-dependent knowledge.
+- `global` is for lessons that stay correct across unrelated repositories without relying on project conventions. Uncertainty defaults to `repository`.
+
+Repository candidates, resolutions, and retrieval indexes live under:
+
+```text
+<repository>/.codex/learning/
+```
+
+Global candidates, resolutions, and retrieval indexes live under:
+
+```text
+$CODEX_HOME/codex-gardener-global-learning/
+```
+
+Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` defaults to `~/.codex`. Runtime state and pending-review records remain under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`.
+
+## Learning and promotion model
+
+Each new candidate records an explicit `knowledge_scope`, its existing topical `scope`, a concise lesson and evidence summary, confidence, session ID, target recommendation, and a one-way project fingerprint. The fingerprint is derived from Git remote identity when available, otherwise the resolved repository path; the raw identity is not stored in the candidate.
+
+Repository eligibility:
+
+1. One independent session is a candidate.
+2. Two independent sessions make it confirmed.
+3. Three or more sessions with aggregate confidence of at least `0.85` make it eligible for repository promotion after conflict checks.
+
+Global evidence keeps the same ladder: one session is a candidate and two are confirmed. Three or more sessions below aggregate confidence `0.85` remain confirmed. Confidence-qualified evidence from only one project is proposed rather than eligible. Global eligibility requires at least three independent sessions, aggregate confidence of at least `0.85`, and evidence from at least two distinct project fingerprints. A fingerprint is a diversity signal, not proof that projects are unrelated. The curator must inspect representative project conventions and choose the narrowest valid scope.
+
+Global changes have higher blast radius. Even eligible global guidance requires explicit user confirmation before writing `$CODEX_HOME/AGENTS.md` or `$CODEX_HOME/skills/`. Concise global principles belong in global `AGENTS.md`; portable multi-step workflows usually belong in a validated global Skill. Global hooks, configuration, and plugin changes remain proposal-only.
+
+Promoted global keyword matches are available in every project context, including non-Git directories. Repository entries are retrieved only inside their owning repository. When the same fingerprint exists in both indexes, the repository entry wins so combined context does not duplicate the lesson.
 
 ## Usage
 
-Normal use is passive after you trust the hooks. A completed task with useful signals may be held briefly so `$gardener-capture` can record a bounded retrospective. You can also invoke the workflows directly:
+Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$gardener-capture` can record a bounded retrospective. You can also invoke either workflow directly:
 
 ```text
-Use $gardener-capture to review this completed task for reusable repository knowledge.
-Use $knowledge-curator to review and promote accumulated repository lessons.
+Use $gardener-capture to review this task and record reusable knowledge at the right scope.
+Use $knowledge-curator to curate repository and global lessons at the narrowest valid scope.
 Use $cross-project-delegation to coordinate this change in the project that owns it.
 ```
 
-Candidate files live under `<repository>/.codex/learning/` and are ignored by a local `.gitignore`. Runtime state defaults to `$CODEX_HOME/codex-gardener-data/`; Codex may instead provide `PLUGIN_DATA`, and advanced users can set `CODEX_GARDENER_DATA` explicitly. See [PRIVACY.md](PRIVACY.md) for the complete data behavior.
+Examples:
+
+- “This repository's generated API clients must never be edited” is repository-scoped.
+- “Inspect the final diff before declaring an implementation complete” may be global if independent projects support it.
+- “Always run pytest” is not global merely because several Python repositories use it.
+
+The CLI keeps backward-compatible defaults:
+
+```bash
+# Existing behavior: repository scope
+python gardener.py groups --repo /path/to/repo
+
+# Cross-project candidate groups
+python gardener.py groups --repo /path/to/repo --knowledge-scope global
+```
+
+Records created before `0.2.0` have no `knowledge_scope`; they continue to load as `repository` and remain in their existing repository store.
 
 ## Update and uninstall
 
@@ -76,7 +118,7 @@ codex plugin marketplace upgrade codex-gardener
 codex plugin add codex-gardener@codex-gardener
 ```
 
-For a cloned installation, run `git pull` and then `python install.py` again.
+For a cloned installation, run `git pull` and then `python install.py` again. Start a new task after updating. Upgrading from `0.1.x` does not migrate or broaden existing candidates; legacy records stay repository-scoped.
 
 To uninstall:
 
@@ -85,24 +127,24 @@ codex plugin remove codex-gardener@codex-gardener
 codex plugin marketplace remove codex-gardener
 ```
 
-Uninstalling does not delete runtime or repository learning data. Review and remove those directories separately if desired.
+Uninstalling does not delete runtime, repository learning, or global learning data. Review and remove those directories separately if desired.
 
 ## Privacy and security
 
-The plugin makes no network requests and includes no telemetry. Hook payloads are processed locally; the plugin persists derived signals and concise candidates, not transcript contents or raw tool output. A pending-review record may contain local repository/transcript paths supplied by Codex. Do not put secrets or personal data in candidate summaries.
+The plugin makes no network requests and includes no telemetry. Hook payloads are processed locally. It persists derived signals and concise candidates, not transcript contents or raw prompts/tool output. Repository paths may appear in runtime pending-review state. Global candidates store concise summaries, session IDs, timestamps, and hashed project fingerprints, so do not put secrets or personal data in summaries.
 
-Hooks execute local commands with your Codex permissions. Review them before trust, install only from a ref you trust, and keep ordinary code review and CI controls in place. The cross-project detector is a useful guardrail, not a complete shell parser or security boundary. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
+Hooks execute local commands with your Codex permissions. Review them before trust, install only from a ref you trust, and preserve normal code review and CI controls. Global promotion is reviewable and confirmation-gated. The cross-project detector is a useful guardrail, not a complete shell parser or security boundary. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- Signal detection is heuristic and may miss useful lessons or request an unnecessary review.
+- Signal and scope classification are heuristic and may miss lessons or choose a scope that needs correction.
+- Project fingerprints establish distinct stored identities, not organizational or semantic independence.
+- Promotion thresholds establish repeated evidence, not truth; the curator must still inspect conflicts, sensitivity, target, and final changes.
+- Global retrieval is keyword-based and intentionally bounded; it can miss synonyms and returns at most three combined entries.
 - The write guard cannot understand every shell construct, symlink, worktree, nested repository, or custom mutating tool.
-- Promotion thresholds establish repeated evidence, not truth; the curator must still inspect the repository and final diff.
-- Transcript formats are unstable. The plugin stores only a supplied path for optional later inspection and never copies transcript contents into its learning inbox.
+- Transcript formats are unstable. The plugin stores only a supplied path for optional later inspection and never copies transcript contents into its learning inboxes.
 
 ## Development
-
-Run the dependency-free validation and tests on Python 3.10+:
 
 ```bash
 python scripts/validate_repository.py
