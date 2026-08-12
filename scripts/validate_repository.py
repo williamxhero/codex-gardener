@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.2.0", "Plugin version must be 0.2.0")
+    require(data.get("version") == "0.3.0", "Plugin version must be 0.3.0")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -94,6 +94,7 @@ def validate_hooks() -> None:
     rendered = path.read_text(encoding="utf-8")
     for script in ("gardener.py", "project_boundary.py"):
         require(script in rendered and (PLUGIN / "scripts" / script).is_file(), f"Hook script is missing: {script}")
+    require((PLUGIN / "scripts" / "effectiveness.py").is_file(), "Effectiveness logger is missing")
 
 
 def validate_skills() -> None:
@@ -129,8 +130,15 @@ def validate_hygiene() -> None:
     for name in ("README.md", "LICENSE", "PRIVACY.md", "SECURITY.md", "CONTRIBUTING.md"):
         require((ROOT / name).is_file(), f"Missing public repository file: {name}")
     gardener_source = (PLUGIN / "scripts" / "gardener.py").read_text(encoding="utf-8")
+    effectiveness_source = (PLUGIN / "scripts" / "effectiveness.py").read_text(encoding="utf-8")
     require("codex-gardener-global-learning" in gardener_source, "Global learning store path is missing")
     require("knowledge_scope" in gardener_source, "Knowledge scope schema is missing")
+    require('sub.add_parser("effectiveness")' in gardener_source, "Effectiveness CLI is missing")
+    require("CODEX_GARDENER_EFFECTIVENESS_LOG" in effectiveness_source, "Effectiveness opt-out is missing")
+    require("MAX_LOG_BYTES" in effectiveness_source and "MAX_BACKUPS" in effectiveness_source, "Effectiveness rotation bounds are missing")
+    for document in (ROOT / "README.md", ROOT / "PRIVACY.md", ROOT / "SECURITY.md"):
+        text = document.read_text(encoding="utf-8")
+        require("CODEX_GARDENER_EFFECTIVENESS_LOG" in text, f"Effectiveness opt-out is undocumented in {document.name}")
 
 
 def main() -> int:

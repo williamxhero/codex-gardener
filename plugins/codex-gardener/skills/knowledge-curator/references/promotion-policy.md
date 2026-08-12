@@ -28,3 +28,5 @@
 ## Resolution
 
 Record `promoted` only after the file change and validation succeed. Record it in the same knowledge scope as the candidate. A promoted candidate is added to that scope's ignored retrieval index used by `UserPromptSubmit`; unresolved inbox records remain append-only evidence.
+
+Effectiveness counts and hit rates may identify noisy triggers, unused context, or review backlog. They do not count as independent candidate evidence and must not relax confidence, cross-project diversity, conflict, sensitivity, validation, or confirmation requirements.

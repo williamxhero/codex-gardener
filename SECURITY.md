@@ -12,4 +12,6 @@ Codex Gardener runs local Python commands at Codex lifecycle boundaries. Review 
 
 Knowledge candidates are untrusted input. Review evidence and scope before promotion, keep secrets out of summaries, inspect every diff, and preserve normal repository review and CI controls. Global promotion has wider impact and must remain confirmation-gated. Project fingerprints are diversity signals, not security identities or proof of project independence. Install only from a repository and Git ref you trust.
 
+Effectiveness logs are local operational records, not a security boundary or tamper-proof audit trail. Their schema rejects fields outside a small allowlist and hashes correlating identifiers, but local users and processes with filesystem access can read, change, or delete them. Logging and rotation failures fail open so they never interrupt a Codex hook or Gardener CLI operation. Set `CODEX_GARDENER_EFFECTIVENESS_LOG=0` to disable these events.
+
 This project is community-maintained and is not an official OpenAI product.

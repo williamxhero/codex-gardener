@@ -1,7 +1,7 @@
 {
   "name": "codex-gardener",
-  "version": "0.2.0",
-  "description": "Promote repeated Codex task lessons at the right scope, from one repository to every project.",
+  "version": "0.3.0",
+  "description": "Promote repeated Codex task lessons at the right scope and audit their local effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",
     "url": "https://github.com/williamxhero"
@@ -20,13 +20,14 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Gardener",
-    "shortDescription": "Promote reusable knowledge at the right scope.",
-    "longDescription": "Capture lessons from real Codex tasks, distinguish repository-specific knowledge from portable global knowledge, aggregate independent evidence, and safely promote proven guidance at the narrowest valid scope.",
+    "shortDescription": "Promote and audit reusable knowledge locally.",
+    "longDescription": "Capture lessons from real Codex tasks, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
     "developerName": "williamxhero",
     "category": "Developer Tools",
     "capabilities": [
       "Repository and global learning",
       "Lifecycle hooks",
+      "Local effectiveness reports",
       "Cross-project guardrails"
     ],
     "websiteURL": "https://github.com/williamxhero/codex-gardener",

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "plugins" / "codex-gardener" / "scripts" / "project_boundary.py"
@@ -23,6 +26,18 @@ class ProjectBoundaryTest(unittest.TestCase):
         self.other = root / "other"
         self.primary.mkdir()
         self.other.mkdir()
+        self.data = root / "plugin-data"
+        self.env = patch.dict(
+            os.environ,
+            {
+                "CODEX_GARDENER_DATA": str(self.data),
+                "CODEX_HOME": str(root / "codex-home"),
+                "CODEX_GARDENER_EFFECTIVENESS_LOG": "1",
+            },
+            clear=False,
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
         subprocess.run(["git", "init", "-q", str(self.primary)], check=True)
         subprocess.run(["git", "init", "-q", str(self.other)], check=True)
 
@@ -42,6 +57,12 @@ class ProjectBoundaryTest(unittest.TestCase):
         output = result["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("$cross-project-delegation", output["permissionDecisionReason"])
+        events = project_boundary.effectiveness.read_events(root=self.data)[0]
+        self.assertEqual(events[0]["event"], "project_boundary_denied")
+        self.assertEqual(events[0]["tool_category"], "patch")
+        rendered = json.dumps(events)
+        self.assertNotIn(str(self.primary), rendered)
+        self.assertNotIn(str(self.other), rendered)
 
     def test_denies_shell_write_with_explicit_other_repo_path(self) -> None:
         command = f'Set-Content -LiteralPath "{self.other / "file.txt"}" -Value changed'

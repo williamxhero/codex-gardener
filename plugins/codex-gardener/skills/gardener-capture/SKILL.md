@@ -32,6 +32,8 @@ python <plugin-root>\scripts\gardener.py record `
 6. If nothing is reusable, run `python <plugin-root>\scripts\gardener.py review-complete --session-id <session-id>`.
 7. Report what was recorded and at which knowledge scope, or state that the review produced no candidate.
 
+The CLI records only a low-sensitivity effectiveness event for the outcome: hashed session/project identities, scope, target, and confidence bucket, or completion without a candidate. Do not add prompts, tool data, paths, or transcript content to support that audit.
+
 ## Boundaries
 
 - Do not modify repository or global `AGENTS.md`, Skills, tests, Hooks, docs, configuration, or this plugin during capture.

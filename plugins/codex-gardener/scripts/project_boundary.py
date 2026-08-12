@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import effectiveness
+
+
 MUTATING_NAME_RE = re.compile(
     r"(?:^|[_:.\-])(add|append|copy|create|delete|edit|move|patch|remove|rename|update|upload|write)(?:$|[_:.\-])",
     re.IGNORECASE,
@@ -121,6 +128,20 @@ def resolve_target(raw: str, base: Path) -> Path | None:
         return None
 
 
+def tool_category(tool_name: str, tool_input: Any) -> str:
+    lowered = tool_name.casefold()
+    command = command_from(tool_input).casefold()
+    if lowered == "apply_patch" or "*** begin patch" in command:
+        return "patch"
+    if lowered in {"bash", "shell", "shell_command"}:
+        return "git" if re.search(r"\bgit\s+(?:add|commit|mv|rm)\b", command) else "shell"
+    if lowered in {"edit", "write"}:
+        return "file"
+    if lowered.startswith(("mcp", "mcp__")):
+        return "mcp"
+    return "other"
+
+
 def denial(payload: dict[str, Any]) -> dict[str, Any] | None:
     cwd = Path(str(payload.get("cwd") or os.getcwd())).resolve()
     primary = git_root(cwd)
@@ -142,6 +163,13 @@ def denial(payload: dict[str, Any]) -> dict[str, Any] | None:
         owner = git_root(target)
         if owner is None or same_path(owner, primary):
             continue
+        effectiveness.log_event(
+            "project_boundary_denied",
+            session=payload.get("session_id"),
+            primary_project=str(primary),
+            target_project=str(owner),
+            tool_category=tool_category(tool_name, tool_input),
+        )
         reason = (
             f"Cross-project write blocked: the target belongs to {owner}, while this task's primary "
             f"repository is {primary}. Use $cross-project-delegation and perform the change in an "

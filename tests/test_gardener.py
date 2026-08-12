@@ -113,6 +113,8 @@ class GardenerTest(unittest.TestCase):
         self.assertIn("$gardener-capture", first["reason"])
         second = self.run_hook("Stop", self.payload(stop_hook_active=True))
         self.assertEqual(second, {"continue": True})
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["completed_without_candidate"], 1)
 
     def test_correction_and_repeated_failures_trigger(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
@@ -487,6 +489,58 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(resolved.stdout)["knowledge_scope"], "global")
         self.assertIn("Keep portable CLI storage global.", gardener.promoted_context(self.other, "portable") or "")
+
+    def test_effectiveness_report_combines_events_pending_and_group_status(self) -> None:
+        self.init_git()
+        gardener.resolve_candidate(self.resolution_args())
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="Update the parser contract"))
+        (self.root / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        stop = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertEqual(stop["decision"], "block")
+        gardener.record_candidate(self.candidate_args())
+
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["coverage"]["sessions_observed"], 1)
+        self.assertEqual(report["reviews"]["requested"], 1)
+        self.assertEqual(report["reviews"]["captures_recorded"], 1)
+        self.assertEqual(report["context"]["lookups"], 1)
+        self.assertEqual(report["context"]["hits_repository"], 1)
+        self.assertEqual(report["reviews"]["current_pending"], 0)
+        self.assertEqual(report["candidate_group_status"]["repository"], {"candidate": 1})
+
+        rendered = gardener.effectiveness.log_path(self.data).read_text(encoding="utf-8")
+        self.assertNotIn("Update the parser contract", rendered)
+        self.assertNotIn("session-1", rendered)
+        self.assertNotIn(str(self.root), rendered)
+
+    def test_effectiveness_tracks_no_candidate_and_current_pending(self) -> None:
+        self.init_git()
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        gardener.complete_review_without_candidate("session-1")
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["completed_without_candidate"], 1)
+
+        second = self.payload(session_id="session-2", turn_id="turn-2")
+        self.run_hook("SessionStart", second)
+        self.run_hook(
+            "PostToolUse",
+            self.payload(
+                session_id="session-2",
+                turn_id="turn-2",
+                tool_name="apply_patch",
+                tool_input={"patch": "private contents"},
+                tool_response={"status": "ok"},
+            ),
+        )
+        self.run_hook("SessionEnd", second)
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["pending_queued"], 1)
+        self.assertEqual(report["reviews"]["current_pending"], 1)
+        gardener.resolve_pending("session-2")
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["pending_resolved"], 1)
+        self.assertEqual(report["reviews"]["current_pending"], 0)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ Use `python3` when `python` is unavailable. The installer locates `codex`, valid
 | `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
 | `$gardener-capture` | Classify each lesson as repository or global and append concise evidence without editing promoted artifacts. |
 | `$knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
+| `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
 | `$cross-project-delegation` | Move authorized implementation into a task or agent context owned by the target repository. |
 
@@ -64,6 +65,32 @@ $CODEX_HOME/codex-gardener-global-learning/
 ```
 
 Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` defaults to `~/.codex`. Runtime state and pending-review records remain under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`.
+
+## Local effectiveness audit
+
+Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin data root:
+
+```text
+<plugin-data>/effectiveness/events.jsonl
+```
+
+It records only allow-listed derived events: session and project hashes, promoted-context lookup and hit counts split by repository/global scope, safe retrospective signal categories, capture scope/target/confidence bucket, no-candidate completion, pending queue changes, resolution distributions, and cross-project denial categories. It does not record prompts, tool input/output, transcripts, file contents, secrets, raw paths, or raw session/turn IDs. Ordinary tool calls are not logged.
+
+The active log rotates at 1 MiB, keeps at most four bounded backups, and discards rotated files older than 90 days. Logging uses only the Python standard library, is concurrency-safe, and always fails open. Disable it before starting Codex with:
+
+```bash
+CODEX_GARDENER_EFFECTIVENESS_LOG=0
+```
+
+On PowerShell use `$env:CODEX_GARDENER_EFFECTIVENESS_LOG = "0"`. Generate a human-readable 14-day report or deterministic JSON with:
+
+```bash
+python <plugin-root>/scripts/gardener.py effectiveness
+python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --json
+python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /path/to/repo --json
+```
+
+Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. Treat these metrics as operational evidence: hit rates and capture rates can reveal whether Gardener is useful or noisy, but do not replace conflict checks or promotion thresholds.
 
 ## Learning and promotion model
 
@@ -131,7 +158,7 @@ Uninstalling does not delete runtime, repository learning, or global learning da
 
 ## Privacy and security
 
-The plugin makes no network requests and includes no telemetry. Hook payloads are processed locally. It persists derived signals and concise candidates, not transcript contents or raw prompts/tool output. Repository paths may appear in runtime pending-review state. Global candidates store concise summaries, session IDs, timestamps, and hashed project fingerprints, so do not put secrets or personal data in summaries.
+The plugin makes no network requests and includes no network telemetry. Hook payloads are processed locally. It persists derived signals and concise candidates, not transcript contents or raw prompts/tool output. Repository paths may appear in runtime pending-review state. Effectiveness logs use allow-listed counts, categories, and hashed identities only. Global candidates store concise summaries, session IDs, timestamps, and hashed project fingerprints, so do not put secrets or personal data in summaries.
 
 Hooks execute local commands with your Codex permissions. Review them before trust, install only from a ref you trust, and preserve normal code review and CI controls. Global promotion is reviewable and confirmation-gated. The cross-project detector is a useful guardrail, not a complete shell parser or security boundary. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
 
@@ -142,6 +169,7 @@ Hooks execute local commands with your Codex permissions. Review them before tru
 - Promotion thresholds establish repeated evidence, not truth; the curator must still inspect conflicts, sensitivity, target, and final changes.
 - Global retrieval is keyword-based and intentionally bounded; it can miss synonyms and returns at most three combined entries.
 - The write guard cannot understand every shell construct, symlink, worktree, nested repository, or custom mutating tool.
+- Effectiveness metrics show observed behavior, not whether a promoted lesson was objectively correct; low-volume windows can be misleading.
 - Transcript formats are unstable. The plugin stores only a supplied path for optional later inspection and never copies transcript contents into its learning inboxes.
 
 ## Development

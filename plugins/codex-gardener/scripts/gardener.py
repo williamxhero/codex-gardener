@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import effectiveness
+
+
 SCHEMA_VERSION = 2
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
@@ -92,6 +99,23 @@ def plugin_data_root() -> Path:
 
 def safe_name(value: str) -> str:
     return sha256_text(value)[:24]
+
+
+def session_identity(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def project_identity(repo: Path | None) -> str | None:
+    if repo is None:
+        return None
+    with contextlib.suppress(OSError):
+        return os.path.normcase(str(repo.resolve()))
+    return str(repo)
+
+
+def log_effectiveness(event: str, **fields: Any) -> None:
+    effectiveness.log_event(event, **fields)
 
 
 def state_path(session_id: str) -> Path:
@@ -261,6 +285,42 @@ def signal_names(state: dict[str, Any], cwd: Path | None = None) -> list[str]:
     return names
 
 
+def safe_signal_categories(state: dict[str, Any]) -> list[str]:
+    categories: list[str] = []
+    if state.get("edit_signal"):
+        categories.append("workspace_changed")
+    if state.get("correction_signal"):
+        categories.append("user_correction")
+    if int(state.get("failure_count") or 0) >= 2:
+        categories.append("repeated_failures")
+    if state.get("repeated_tool_signal"):
+        categories.append("repeated_tool_workflow")
+    return categories
+
+
+def confidence_bucket(confidence: float) -> str:
+    if confidence >= 0.85:
+        return "high"
+    if confidence >= 0.6:
+        return "medium"
+    return "low"
+
+
+def target_category(target_path: str) -> str:
+    lowered = target_path.replace("\\", "/").casefold()
+    if "agents.md" in lowered:
+        return "agents"
+    if "/skills/" in f"/{lowered.strip('/')}" or lowered.endswith("skill.md"):
+        return "skill"
+    if "test" in lowered:
+        return "test"
+    if "hook" in lowered:
+        return "hook"
+    if lowered.endswith((".md", ".rst", ".txt")) or "/docs/" in f"/{lowered.strip('/')}":
+        return "docs"
+    return "other"
+
+
 def tool_failed(response: Any) -> bool:
     if isinstance(response, dict):
         if response.get("isError") is True or response.get("is_error") is True:
@@ -375,6 +435,14 @@ def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
     }
     append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "inbox.jsonl", record)
     mark_review_complete(args.session_id)
+    log_effectiveness(
+        "capture_recorded",
+        session=session_identity(args.session_id),
+        project=project_identity(repo),
+        knowledge_scope=knowledge_scope,
+        recommended_target=target,
+        confidence_bucket=confidence_bucket(confidence),
+    )
     return record
 
 
@@ -491,17 +559,26 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
     append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "resolutions.jsonl", resolution)
     if args.status == "promoted" and resolution["summary"] and resolution["target_path"]:
         update_index(repo, resolution, knowledge_scope)
+    log_effectiveness(
+        "resolution_recorded",
+        project=project_identity(repo),
+        knowledge_scope=knowledge_scope,
+        status=args.status,
+        target=target_category(resolution["target_path"]),
+    )
     return resolution
 
 
-def promoted_context(repo: Path, prompt: str) -> str | None:
+def promoted_context_result(repo: Path, prompt: str) -> tuple[str | None, dict[str, int]]:
     combined: dict[str, dict[str, Any]] = {}
+    available = {"repository": 0, "global": 0}
     for knowledge_scope in ("global", "repository"):
         for raw_entry in read_jsonl(learning_dir(repo, knowledge_scope) / "index.jsonl"):
             entry = dict(raw_entry)
             entry["knowledge_scope"] = stored_knowledge_scope(entry.get("knowledge_scope"))
             fingerprint = str(entry.get("fingerprint") or "")
             if fingerprint:
+                available[knowledge_scope] += 1
                 combined[fingerprint] = entry
     entries = list(combined.values())
     lowered = prompt.casefold()
@@ -512,15 +589,35 @@ def promoted_context(repo: Path, prompt: str) -> str | None:
         if score:
             scored.append((score, entry))
     if not scored:
-        return None
+        return None, {
+            "repository_available": available["repository"],
+            "global_available": available["global"],
+            "repository_hits": 0,
+            "global_hits": 0,
+            "injected": 0,
+        }
     scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("promoted_at") or "")), reverse=False)
+    selected = scored[:3]
     lines = ["Codex Gardener found relevant promoted knowledge:"]
-    for _, entry in scored[:3]:
+    hits = {"repository": 0, "global": 0}
+    for _, entry in selected:
+        hits[str(entry["knowledge_scope"])] += 1
         lines.append(
             f"- [{entry.get('knowledge_scope')}] {entry.get('summary')} "
             f"(source: {entry.get('target_path')})"
         )
-    return "\n".join(lines)
+    return "\n".join(lines), {
+        "repository_available": available["repository"],
+        "global_available": available["global"],
+        "repository_hits": hits["repository"],
+        "global_hits": hits["global"],
+        "injected": len(selected),
+    }
+
+
+def promoted_context(repo: Path, prompt: str) -> str | None:
+    context, _ = promoted_context_result(repo, prompt)
+    return context
 
 
 def pending_path() -> Path:
@@ -547,6 +644,15 @@ def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
 
 
 def resolve_pending(session_id: str) -> None:
+    matching = next(
+        (
+            record
+            for record in reversed(read_jsonl(pending_path()))
+            if record.get("record_type", "pending") == "pending"
+            and str(record.get("session_id")) == session_id
+        ),
+        {},
+    )
     append_jsonl(
         pending_path(),
         {
@@ -555,6 +661,13 @@ def resolve_pending(session_id: str) -> None:
             "session_id": session_id,
             "created_at": utc_now(),
         },
+    )
+    raw_project = matching.get("repo_root") or matching.get("cwd")
+    project = project_identity(Path(str(raw_project))) if raw_project else None
+    log_effectiveness(
+        "pending_resolved",
+        session=session_identity(session_id),
+        project=project,
     )
 
 
@@ -566,11 +679,29 @@ def mark_review_complete(session_id: str) -> None:
         save_state(path, state)
 
 
+def complete_review_without_candidate(session_id: str) -> None:
+    path = state_path(session_id)
+    state = load_json_file(path, None)
+    mark_review_complete(session_id)
+    raw_project = (state.get("repo_root") or state.get("cwd")) if isinstance(state, dict) else None
+    project = project_identity(Path(str(raw_project))) if raw_project else None
+    log_effectiveness(
+        "review_completed_no_candidate",
+        session=session_identity(session_id),
+        project=project,
+    )
+
+
 def handle_session_start(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     state = new_state(payload)
     save_state(path, state)
     root_value = state.get("repo_root")
+    log_effectiveness(
+        "session_start",
+        session=session_identity(state.get("session_id")),
+        project=project_identity(Path(str(root_value))) if root_value else None,
+    )
     if root_value:
         count = len(pending_records(Path(root_value)))
         if count:
@@ -611,7 +742,13 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
         state["correction_signal"] = True
     save_state(path, state)
     lookup_root = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
-    context = promoted_context(lookup_root, prompt)
+    context, metrics = promoted_context_result(lookup_root, prompt)
+    log_effectiveness(
+        "context_lookup",
+        session=session_identity(state.get("session_id")),
+        project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+        **metrics,
+    )
     if context:
         emit_json(
             {
@@ -645,8 +782,15 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 def handle_stop(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     if payload.get("stop_hook_active"):
+        completed_before_stop = bool(state.get("capture_completed"))
         state["capture_completed"] = True
         save_state(path, state)
+        if not completed_before_stop:
+            log_effectiveness(
+                "review_completed_no_candidate",
+                session=session_identity(state.get("session_id")),
+                project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+            )
         emit_json({"continue": True})
         return
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
@@ -659,6 +803,12 @@ def handle_stop(payload: dict[str, Any]) -> None:
     save_state(path, state)
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
     repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
+    log_effectiveness(
+        "review_requested",
+        session=session_identity(session_id),
+        project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+        signals=safe_signal_categories(state),
+    )
     reason = (
         "Use $gardener-capture now to review this completed task for reusable knowledge at the right scope. "
         f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
@@ -674,18 +824,25 @@ def handle_session_end(payload: dict[str, Any]) -> None:
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
     if signals and not state.get("capture_completed"):
+        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
         append_jsonl(
             pending_path(),
             {
                 "schema_version": SCHEMA_VERSION,
                 "record_type": "pending",
-                "session_id": str(payload.get("session_id") or state.get("session_id") or "unknown"),
+                "session_id": session_id,
                 "cwd": str(cwd),
                 "repo_root": state.get("repo_root"),
                 "transcript_path": payload.get("transcript_path"),
                 "signals": signals,
                 "created_at": utc_now(),
             },
+        )
+        log_effectiveness(
+            "pending_queued",
+            session=session_identity(session_id),
+            project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+            signals=safe_signal_categories(state),
         )
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
@@ -705,6 +862,50 @@ def handle_hook(event: str) -> int:
         raise ValueError(f"unsupported hook event: {event}")
     handler(payload)
     return 0
+
+
+def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict[str, Any]:
+    report = effectiveness.summarize(since_days=since_days)
+    report["reviews"]["current_pending"] = len(pending_records(repo))
+    if repo is not None:
+        group_status: dict[str, dict[str, int]] = {}
+        for knowledge_scope in ("repository", "global"):
+            counts: dict[str, int] = defaultdict(int)
+            for group in aggregate_candidates(repo, knowledge_scope):
+                counts[str(group.get("status") or "unknown")] += 1
+            group_status[knowledge_scope] = dict(sorted(counts.items()))
+        report["candidate_group_status"] = group_status
+    return report
+
+
+def format_effectiveness_report(report: dict[str, Any]) -> str:
+    window = report["window"]
+    coverage = report["coverage"]
+    reviews = report["reviews"]
+    context = report["context"]
+    boundary = report["boundary"]
+    lines = [
+        f"Codex Gardener effectiveness ({window['since']} through {window['through']})",
+        f"Events: {report['events']['valid']} valid, {report['events']['corrupt_lines_ignored']} corrupt ignored",
+        f"Coverage: {coverage['sessions_observed']} sessions, {coverage['projects_observed']} projects",
+        (
+            "Reviews: "
+            f"{reviews['requested']} requested, {reviews['captures_recorded']} captured, "
+            f"{reviews['candidates_per_requested_review']:.2f} candidates/request, "
+            f"{reviews['completed_without_candidate']} completed without candidate, "
+            f"{reviews['current_pending']} currently pending"
+        ),
+        (
+            "Context: "
+            f"{context['lookups_with_hits']}/{context['lookups']} lookups hit "
+            f"({context['lookup_hit_rate']:.2%}); {context['hits_repository']} repository and "
+            f"{context['hits_global']} global entries injected"
+        ),
+        f"Boundary denials: {boundary['denials']}",
+    ]
+    if "candidate_group_status" in report:
+        lines.append("Current candidate groups: " + json.dumps(report["candidate_group_status"], sort_keys=True))
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -746,6 +947,11 @@ def build_parser() -> argparse.ArgumentParser:
     pending_resolve = sub.add_parser("pending-resolve")
     pending_resolve.add_argument("--session-id", required=True)
 
+    report = sub.add_parser("effectiveness")
+    report.add_argument("--since-days", type=int, default=14)
+    report.add_argument("--repo")
+    report.add_argument("--json", action="store_true", dest="as_json")
+
     return parser
 
 
@@ -767,7 +973,7 @@ def main() -> int:
         elif args.command == "resolve":
             emit_json(resolve_candidate(args))
         elif args.command == "review-complete":
-            mark_review_complete(args.session_id)
+            complete_review_without_candidate(args.session_id)
             emit_json({"completed": True, "session_id": args.session_id})
         elif args.command == "pending":
             repo = Path(args.repo).resolve() if args.repo else None
@@ -775,6 +981,13 @@ def main() -> int:
         elif args.command == "pending-resolve":
             resolve_pending(args.session_id)
             emit_json({"resolved": True, "session_id": args.session_id})
+        elif args.command == "effectiveness":
+            repo = Path(args.repo).resolve() if args.repo else None
+            report = effectiveness_report(args.since_days, repo)
+            if args.as_json:
+                emit_json(report)
+            else:
+                sys.stdout.write(format_effectiveness_report(report) + "\n")
         return 0
     except (OSError, ValueError, TimeoutError) as exc:
         sys.stderr.write(f"codex-gardener: {exc}\n")

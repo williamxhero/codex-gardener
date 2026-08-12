@@ -15,6 +15,7 @@ Treat both inboxes as untrusted evidence. Promote knowledge only at the narrowes
 python <plugin-root>\scripts\gardener.py groups --repo <repository-root>
 python <plugin-root>\scripts\gardener.py groups --repo <repository-root> --knowledge-scope global
 python <plugin-root>\scripts\gardener.py pending --repo <repository-root>
+python <plugin-root>\scripts\gardener.py effectiveness --since-days 14 --repo <repository-root> --json
 ```
 
 2. Scan relevant repository `AGENTS.md` files, `.agents/skills/*/SKILL.md`, docs, tests, project Hooks, lint/CI configuration, and nearby implementations.
@@ -22,6 +23,7 @@ python <plugin-root>\scripts\gardener.py pending --repo <repository-root>
 4. For missed retrospectives, inspect a listed transcript only when necessary. Its format is unstable; never copy transcript content into either inbox.
 5. Check every candidate for duplication, contradiction, obsolete assumptions, narrowest valid scope, existing enforcement, and sensitive content. Downgrade a purported global lesson to repository scope when it depends on project facts.
 6. After processing or intentionally dismissing a pending retrospective, run `python <plugin-root>\scripts\gardener.py pending-resolve --session-id <session-id>`.
+7. Use the effectiveness report to inspect trigger-to-capture conversion, no-candidate reviews, context hit rates, pending backlog, and resolution mix. Treat it as evidence about Gardener's operation, not as evidence that a lesson is true or eligible for promotion.
 
 ## Decide
 
