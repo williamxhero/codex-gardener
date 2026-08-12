@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cross-Project Delegation"
+  short_description: "Delegate changes to the project that owns them"
+  default_prompt: "Use $cross-project-delegation to coordinate changes that belong to another project without writing across project boundaries."

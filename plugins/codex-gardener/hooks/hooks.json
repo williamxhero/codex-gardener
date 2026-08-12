@@ -1,0 +1,80 @@
+{
+  "description": "Collect low-risk task signals and request one bounded knowledge review when useful.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/project_boundary.py\"",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\project_boundary.py\"",
+            "timeout": 3,
+            "statusMessage": "Checking project ownership boundary"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook SessionStart",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook SessionStart",
+            "timeout": 3,
+            "statusMessage": "Starting Codex Gardener"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook UserPromptSubmit",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook UserPromptSubmit",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook PostToolUse",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook PostToolUse",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook Stop",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook Stop",
+            "timeout": 5,
+            "statusMessage": "Checking for reusable knowledge"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook SessionEnd",
+            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook SessionEnd",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

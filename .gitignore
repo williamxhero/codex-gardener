@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.log
+.coverage
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+
+# Codex Gardener runtime and repository-local learning data.
+.codex/learning/*.jsonl
+codex-gardener-data/
+codex-gardener-data-path

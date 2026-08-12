@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gardener Capture"
+  short_description: "Capture reusable engineering lessons"
+  default_prompt: "Use $gardener-capture to review this task and record reusable knowledge."

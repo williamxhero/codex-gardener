@@ -1,0 +1,39 @@
+{
+  "name": "codex-gardener",
+  "version": "0.1.0",
+  "description": "Turn repeated Codex task lessons into verified, repository-scoped knowledge.",
+  "author": {
+    "name": "williamxhero",
+    "url": "https://github.com/williamxhero"
+  },
+  "homepage": "https://github.com/williamxhero/codex-gardener#readme",
+  "repository": "https://github.com/williamxhero/codex-gardener",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "repository-knowledge",
+    "developer-tools",
+    "hooks",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Gardener",
+    "shortDescription": "Grow verified repository knowledge from completed work.",
+    "longDescription": "Capture reusable lessons from real Codex tasks, aggregate independent evidence, and safely promote proven knowledge into scoped instructions, skills, tests, hooks, or documentation.",
+    "developerName": "williamxhero",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Repository learning",
+      "Lifecycle hooks",
+      "Cross-project guardrails"
+    ],
+    "websiteURL": "https://github.com/williamxhero/codex-gardener",
+    "privacyPolicyURL": "https://github.com/williamxhero/codex-gardener/blob/main/PRIVACY.md",
+    "defaultPrompt": [
+      "Review this completed task for reusable repository knowledge.",
+      "Curate this repository's accumulated learning candidates.",
+      "Coordinate this cross-project change in the repository that owns it."
+    ]
+  }
+}
