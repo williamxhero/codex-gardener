@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.3.0", "Plugin version must be 0.3.0")
+    require(data.get("version") == "0.3.1", "Plugin version must be 0.3.1")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -111,6 +111,21 @@ def validate_skills() -> None:
         require(openai_yaml.is_file(), f"Missing agents/openai.yaml for {name}")
         yaml_text = openai_yaml.read_text(encoding="utf-8")
         require(f"${name}" in yaml_text, f"Default prompt must mention ${name}")
+
+    delegation = (skills / "cross-project-delegation" / "SKILL.md").read_text(encoding="utf-8").lower()
+    for requirement in (
+        "each writer must use one unique git worktree and branch",
+        "writers must not share a working tree",
+        "pin an exact base commit",
+        "dedicated, clean integration worktree and branch",
+        "never integrate concurrent work in the shared or main checkout",
+        "merge or cherry-pick completed branches serially",
+        "resolve conflicts only in that integration worktree",
+        "rerun relevant validation after each merge",
+        "run the full acceptance suite after the final integration",
+        "do not proceed with concurrent writes",
+    ):
+        require(requirement in delegation, f"Concurrent-writer policy is missing: {requirement}")
 
 
 def validate_python() -> None:
