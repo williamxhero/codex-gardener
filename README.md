@@ -4,7 +4,7 @@ Codex Gardener turns lessons from completed Codex tasks into small, verified kno
 
 Capture and promotion are separate. The plugin records concise candidates first, accumulates independent evidence, then helps a curator challenge scope, conflicts, sensitivity, and target before anything becomes lasting guidance.
 
-It also includes an opt-in cross-project write guard. When a task attempts to write into another Git repository, the guard points Codex to a bundled delegation workflow so the target project remains the implementation context.
+It also includes an opt-in cross-project write guard. When a task attempts to write into another Git repository, the guard points Codex to a bundled delegation workflow so the target project remains the implementation context. The same workflow requires a unique Git worktree and branch for each concurrent writer that may touch one repository or overlapping plugin files.
 
 > Codex Gardener is an independent community project. It is not an official OpenAI product.
 
@@ -45,7 +45,7 @@ Use `python3` when `python` is unavailable. The installer locates `codex`, valid
 | `$knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
 | `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
-| `$cross-project-delegation` | Move authorized implementation into a task or agent context owned by the target repository. |
+| `$cross-project-delegation` | Move authorized implementation into its owning repository and isolate concurrent writers in unique Git worktrees. |
 
 ### Two knowledge scopes
 
@@ -117,6 +117,8 @@ Use $gardener-capture to review this task and record reusable knowledge at the r
 Use $knowledge-curator to curate repository and global lessons at the narrowest valid scope.
 Use $cross-project-delegation to coordinate this change in the project that owns it.
 ```
+
+For concurrent repository maintenance, the Skill first inspects existing worktrees and branches, pins a base commit, assigns one unique worktree and branch per writer, and forbids shared-checkout writes. One coordinator then merges or cherry-picks branches serially in a dedicated, clean integration worktree and branch—not the shared or main checkout—resolves conflicts there, reruns validation after every merge, and runs the full acceptance suite after final integration. If isolation cannot be established, concurrent writes must stop or be serialized. Worktrees are removed only after their branches and exact resolved paths are verified.
 
 Examples:
 

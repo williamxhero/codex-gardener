@@ -1,6 +1,6 @@
 {
   "name": "codex-gardener",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Promote repeated Codex task lessons at the right scope and audit their local effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",
@@ -21,21 +21,21 @@
   "interface": {
     "displayName": "Codex Gardener",
     "shortDescription": "Promote and audit reusable knowledge locally.",
-    "longDescription": "Capture lessons from real Codex tasks, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
+    "longDescription": "Capture lessons from real Codex tasks, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, isolate concurrent repository writers with Git worktrees, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
     "developerName": "williamxhero",
     "category": "Developer Tools",
     "capabilities": [
       "Repository and global learning",
       "Lifecycle hooks",
       "Local effectiveness reports",
-      "Cross-project guardrails"
+      "Cross-project and worktree guardrails"
     ],
     "websiteURL": "https://github.com/williamxhero/codex-gardener",
     "privacyPolicyURL": "https://github.com/williamxhero/codex-gardener/blob/main/PRIVACY.md",
     "defaultPrompt": [
       "Review this completed task and capture reusable knowledge at the right scope.",
       "Curate repository and global learning candidates.",
-      "Coordinate this cross-project change in the repository that owns it."
+      "Coordinate repository writes with project ownership and isolated Git worktrees."
     ]
   }
 }
