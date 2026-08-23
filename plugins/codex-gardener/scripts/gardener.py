@@ -51,6 +51,7 @@ PENDING_CLAIM_TTL_SECONDS = 60 * 60
 SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
 SCHEDULED_MAINTENANCE_MARKER = "[codex-gardener:scheduled-maintenance]"
 AUDIT_REASONS = {"review_threshold", "elapsed_time", "forced", "scheduled"}
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s'\"(])(?:[A-Za-z]:[\\/]|\\\\)")
 CORRECTION_RE = re.compile(
     r"(?:不对|错了|纠正|我说的是|你忘了|没有按|不是.{0,20}而是|"
     r"\bwrong\b|\bincorrect\b|that's not|that is not|i said|you forgot|not what i asked)",
@@ -253,6 +254,14 @@ def project_identity(repo: Path | None) -> str | None:
     with contextlib.suppress(OSError):
         return os.path.normcase(str(repo.resolve()))
     return str(repo)
+
+
+def local_path_identity(value: Any) -> str:
+    text = str(value or "")
+    try:
+        return os.path.normcase(str(Path(text).resolve()))
+    except OSError:
+        return os.path.normcase(os.path.normpath(text))
 
 
 def log_effectiveness(event: str, **fields: Any) -> None:
@@ -829,7 +838,7 @@ def defer_pending_outcome(args: argparse.Namespace) -> dict[str, Any]:
             pending.get("repo_root") or pending.get("cwd"),
             pending.get("transcript_path"),
         )
-        if any(
+        if WINDOWS_ABSOLUTE_PATH_RE.search(marker_text) or any(
             value and str(value).replace("\\", "/").casefold() in marker_text
             for value in sensitive_values
         ):
@@ -1351,7 +1360,7 @@ def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
         session_id = str(raw.get("session_id") or "")
         source = (
             session_id,
-            str(raw.get("repo_root") or raw.get("cwd") or "").casefold(),
+            local_path_identity(raw.get("repo_root") or raw.get("cwd")),
         )
         if (
             pending_id in resolved_ids
@@ -1398,8 +1407,12 @@ def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
     records = active_pending_records(read_jsonl(pending_path()))
     if repo is None:
         return records
-    wanted = str(repo.resolve()).casefold()
-    return [record for record in records if str(record.get("repo_root") or record.get("cwd") or "").casefold() == wanted]
+    wanted = local_path_identity(repo)
+    return [
+        record
+        for record in records
+        if local_path_identity(record.get("repo_root") or record.get("cwd")) == wanted
+    ]
 
 
 def claim_pending_records(
@@ -1493,7 +1506,8 @@ def queue_pending_review(state: dict[str, Any], payload: dict[str, Any]) -> tupl
                 if item.get("pending_id") == pending_id
                 or (
                     str(item.get("session_id") or "") == session_id
-                    and str(item.get("repo_root") or item.get("cwd") or "").casefold() == repo_value.casefold()
+                    and local_path_identity(item.get("repo_root") or item.get("cwd"))
+                    == local_path_identity(repo_value)
                 )
             ),
             None,
@@ -1645,7 +1659,7 @@ def consume_deferred_pending_outcomes(
                     raw_repo,
                     pending.get("transcript_path"),
                 )
-                if any(
+                if WINDOWS_ABSOLUTE_PATH_RE.search(marker_text) or any(
                     value and str(value).replace("\\", "/").casefold() in marker_text
                     for value in sensitive_values
                 ):

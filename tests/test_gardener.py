@@ -621,7 +621,11 @@ class GardenerTest(unittest.TestCase):
     def test_defer_pending_outcome_rejects_source_identifiers_before_writing(self) -> None:
         pending = self.queue_pending("source-private-session", self.root)
         self.start_maintenance(session_id="maintenance-private")
-        for evidence in (f"Copied from {self.root}", "Observed in source-private-session"):
+        for evidence in (
+            f"Copied from {self.root}",
+            "Copied from C:\\private\\source-repo",
+            "Observed in source-private-session",
+        ):
             result = subprocess.run(
                 [
                     sys.executable,
@@ -660,12 +664,13 @@ class GardenerTest(unittest.TestCase):
         self.assertFalse(any(gardener.deferred_maintenance_dir(self.other, "maintenance-private").glob("*.json")))
 
     def test_legacy_pending_record_gets_a_stable_id_and_can_be_completed_by_maintenance(self) -> None:
+        unresolved_root = self.root / ".." / self.root.name
         legacy = {
             "schema_version": gardener.SCHEMA_VERSION,
             "record_type": "pending",
             "session_id": "legacy-source",
-            "cwd": str(self.root),
-            "repo_root": str(self.root),
+            "cwd": str(unresolved_root),
+            "repo_root": str(unresolved_root),
             "transcript_path": "C:/legacy/rollout.jsonl",
             "signals": ["user correction"],
             "created_at": "2026-08-01T00:00:00Z",
