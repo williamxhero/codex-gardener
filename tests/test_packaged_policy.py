@@ -10,11 +10,11 @@ PLUGIN = ROOT / "plugins" / "codex-gardener"
 
 
 class PackagedPolicyTest(unittest.TestCase):
-    def test_manifest_version_is_0_5_1(self) -> None:
+    def test_manifest_version_is_0_5_2(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.5.1")
+        self.assertEqual(manifest["version"], "0.5.2")
 
     def test_delegation_skill_requires_isolated_concurrent_writers(self) -> None:
         skill = (

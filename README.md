@@ -78,6 +78,8 @@ When due, Stop requests one `$codex-gardener:knowledge-curator` audit-only conti
 
 Version `0.5.1` prevents tools used inside a successfully completed audit continuation from being queued as an unfinished capture at SessionEnd. Smoke audits remain observable but intentionally do not reset the real audit checkpoint or count toward its review threshold.
 
+Version `0.5.2` separates a group's evidence maturity (`evidence_status`) from its effective top-level `status`; the latest `proposed`, `promoted`, or `discarded` resolution now wins without hiding the underlying candidate/confirmed/promotable evidence level. Effectiveness JSON keeps effective counts in `candidate_group_status` and adds parallel evidence counts in `candidate_group_evidence_status`. This version also replaces only the exact legacy standalone cross-project Skill targets in Gardener-owned global index and resolution metadata with the bundled plugin path. Read-only reports normalize those targets in memory, while SessionStart performs the locked, atomic, idempotent persisted migration without changing standalone Skill files or the legacy source store.
+
 ## Local effectiveness audit
 
 Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin data root:
@@ -162,7 +164,7 @@ python gardener.py groups --repo /path/to/repo
 python gardener.py groups --repo /path/to/repo --knowledge-scope global
 ```
 
-Records created before `0.2.0` inside a repository have no `knowledge_scope`; they continue to load as `repository` and remain in that repository store. Version `0.4.0` also reads legacy user-level `$CODEX_HOME/learning/{inbox,index,resolutions}.jsonl` as global knowledge and copies it into the v2 global store at SessionStart or before a global write. Read-only reports can combine the legacy source in memory without changing it. Copies are marked `migration_provenance: legacy-user-learning-v1`, deduplicated by fingerprint/session or resolution identity, and the source files are preserved. Migrated evidence without project fingerprints cannot by itself satisfy the cross-project global promotion threshold.
+Records created before `0.2.0` inside a repository have no `knowledge_scope`; they continue to load as `repository` and remain in that repository store. Version `0.4.0` also reads legacy user-level `$CODEX_HOME/learning/{inbox,index,resolutions}.jsonl` as global knowledge and copies it into the v2 global store at SessionStart or before a global write. Read-only reports can combine the legacy source in memory without changing it. Copies are marked `migration_provenance: legacy-user-learning-v1`, deduplicated by fingerprint/session or resolution identity, and the source files are preserved. Version `0.5.2` normalizes the two historical cross-project delegation Skill targets to `plugins/codex-gardener/skills/cross-project-delegation/SKILL.md`; all unrelated targets remain unchanged. Migrated evidence without project fingerprints cannot by itself satisfy the cross-project global promotion threshold.
 
 ## Update and uninstall
 

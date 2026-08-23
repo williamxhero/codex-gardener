@@ -606,6 +606,7 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["occurrences"], 3)
         self.assertEqual(groups[0]["status"], "promotable")
+        self.assertEqual(groups[0]["evidence_status"], "promotable")
         ignore = (self.root / ".codex" / "learning" / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("inbox.jsonl", ignore)
         self.assertIn("index.jsonl", ignore)
@@ -765,6 +766,22 @@ class GardenerTest(unittest.TestCase):
         self.assertIsNotNone(context)
         self.assertIn("AGENTS.md", context)
 
+    def test_groups_exposes_evidence_maturity_and_latest_resolution_status(self) -> None:
+        candidate = gardener.record_candidate(self.candidate_args())
+
+        for status in ("proposed", "promoted", "discarded"):
+            gardener.resolve_candidate(
+                self.resolution_args(
+                    fingerprint=candidate["fingerprint"],
+                    status=status,
+                )
+            )
+            groups = self.run_cli("groups", "--repo", str(self.root))["groups"]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["status"], status)
+            self.assertEqual(groups[0]["evidence_status"], "candidate")
+            self.assertEqual(groups[0]["resolution"]["status"], status)
+
     def test_legacy_candidate_defaults_to_repository_scope(self) -> None:
         legacy = {
             "schema_version": 1,
@@ -799,6 +816,7 @@ class GardenerTest(unittest.TestCase):
         self.assertIsNone(gardener.promoted_context(self.other, "legacy context"))
 
     def test_user_level_v1_learning_migrates_to_global_store_idempotently(self) -> None:
+        stable_target = "plugins/codex-gardener/skills/cross-project-delegation/SKILL.md"
         legacy = self.codex_home / "learning"
         legacy.mkdir(parents=True)
         candidate = {
@@ -833,6 +851,8 @@ class GardenerTest(unittest.TestCase):
         gardener.append_jsonl(legacy / "inbox.jsonl", candidate)
         gardener.append_jsonl(legacy / "index.jsonl", index)
         gardener.append_jsonl(legacy / "resolutions.jsonl", resolution)
+        legacy_index_before = (legacy / "index.jsonl").read_bytes()
+        legacy_resolution_before = (legacy / "resolutions.jsonl").read_bytes()
 
         first = gardener.aggregate_candidates(self.root, "global")
         self.assertFalse((self.codex_home / "codex-gardener-global-learning" / "inbox.jsonl").exists())
@@ -842,6 +862,9 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(len(second), 1)
         self.assertEqual(first[0]["occurrences"], 1)
         self.assertEqual(first[0]["knowledge_scope"], "global")
+        self.assertEqual(first[0]["status"], "promoted")
+        self.assertEqual(first[0]["evidence_status"], "candidate")
+        self.assertEqual(first[0]["resolution"]["target_path"], stable_target)
         self.assertIn("legacy-user-learning-v1", json.dumps(first))
         self.assertIn("[global]", gardener.promoted_context(self.other, "cross-project") or "")
 
@@ -850,6 +873,155 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(migrated[0]["knowledge_scope"], "global")
         self.assertEqual(migrated[0]["migration_provenance"], "legacy-user-learning-v1")
         self.assertEqual(gardener.read_jsonl(legacy / "inbox.jsonl"), [candidate])
+        migrated_store = self.codex_home / "codex-gardener-global-learning"
+        self.assertEqual(gardener.read_jsonl(migrated_store / "index.jsonl")[0]["target_path"], stable_target)
+        self.assertEqual(gardener.read_jsonl(migrated_store / "resolutions.jsonl")[0]["target_path"], stable_target)
+        self.assertEqual((legacy / "index.jsonl").read_bytes(), legacy_index_before)
+        self.assertEqual((legacy / "resolutions.jsonl").read_bytes(), legacy_resolution_before)
+
+    def test_session_start_migrates_only_exact_global_delegation_targets(self) -> None:
+        stable_target = "plugins/codex-gardener/skills/cross-project-delegation/SKILL.md"
+        store = self.codex_home / "codex-gardener-global-learning"
+        store.mkdir(parents=True)
+        standalone = self.codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
+        standalone.parent.mkdir(parents=True)
+        standalone.write_text("standalone sentinel\n", encoding="utf-8")
+        candidate = {
+            "schema_version": gardener.SCHEMA_VERSION,
+            "id": "candidate-stale-target",
+            "fingerprint": "stale-target",
+            "session_id": "legacy-session",
+            "knowledge_scope": "global",
+            "scope": "coordination",
+            "lesson": "Use the bundled delegation workflow.",
+            "evidence_summary": "Observed before the Skill was bundled.",
+            "recommended_target": "skill",
+            "confidence": 0.9,
+            "created_at": "2026-08-12T00:00:00Z",
+        }
+        gardener.append_jsonl(store / "inbox.jsonl", candidate)
+        resolutions = [
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": "stale-target",
+                "knowledge_scope": "global",
+                "status": "promoted",
+                "summary": "Use the bundled delegation workflow.",
+                "keywords": ["delegation"],
+                "target_path": r"~\.codex\skills\cross-project-delegation\SKILL.md",
+                "created_at": "2026-08-12T00:00:01Z",
+                "sentinel": "preserve-resolution",
+            },
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": "unrelated-target",
+                "knowledge_scope": "global",
+                "status": "promoted",
+                "summary": "Leave unrelated Skills alone.",
+                "keywords": ["unrelated"],
+                "target_path": "~/.codex/skills/unrelated/SKILL.md",
+                "created_at": "2026-08-12T00:00:02Z",
+                "sentinel": "preserve-unrelated",
+            },
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": "already-stable",
+                "knowledge_scope": "global",
+                "status": "promoted",
+                "summary": "Already migrated.",
+                "keywords": ["stable"],
+                "target_path": stable_target,
+                "created_at": "2026-08-12T00:00:03Z",
+                "sentinel": "preserve-stable",
+            },
+        ]
+        indexes = [
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": "stale-target",
+                "knowledge_scope": "global",
+                "summary": "Use the bundled delegation workflow.",
+                "keywords": ["delegation"],
+                "target_path": ".codex/skills/cross-project-delegation/SKILL.md",
+                "promoted_at": "2026-08-12T00:00:01Z",
+                "sentinel": "preserve-index",
+            },
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": "unrelated-target",
+                "knowledge_scope": "global",
+                "summary": "Leave unrelated Skills alone.",
+                "keywords": ["unrelated"],
+                "target_path": ".codex/skills/unrelated/SKILL.md",
+                "promoted_at": "2026-08-12T00:00:02Z",
+                "sentinel": "preserve-unrelated-index",
+            },
+        ]
+        for record in resolutions:
+            gardener.append_jsonl(store / "resolutions.jsonl", record)
+        for record in indexes:
+            gardener.append_jsonl(store / "index.jsonl", record)
+        resolution_before = (store / "resolutions.jsonl").read_bytes()
+        index_before = (store / "index.jsonl").read_bytes()
+
+        groups = self.run_cli(
+            "groups",
+            "--repo",
+            str(self.root),
+            "--knowledge-scope",
+            "global",
+        )["groups"]
+        self.run_cli("effectiveness", "--repo", str(self.root), "--json")
+        self.assertEqual(groups[0]["resolution"]["target_path"], stable_target)
+        self.assertEqual((store / "resolutions.jsonl").read_bytes(), resolution_before)
+        self.assertEqual((store / "index.jsonl").read_bytes(), index_before)
+
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        migrated_resolutions = gardener.read_jsonl(store / "resolutions.jsonl")
+        migrated_indexes = gardener.read_jsonl(store / "index.jsonl")
+        self.assertEqual(
+            [record["fingerprint"] for record in migrated_resolutions],
+            ["stale-target", "unrelated-target", "already-stable"],
+        )
+        self.assertEqual(
+            [record["target_path"] for record in migrated_resolutions],
+            [stable_target, "~/.codex/skills/unrelated/SKILL.md", stable_target],
+        )
+        self.assertEqual(migrated_resolutions[0]["sentinel"], "preserve-resolution")
+        self.assertEqual(
+            [record["target_path"] for record in migrated_indexes],
+            [stable_target, ".codex/skills/unrelated/SKILL.md"],
+        )
+        self.assertEqual(migrated_indexes[0]["sentinel"], "preserve-index")
+        resolution_after = (store / "resolutions.jsonl").read_bytes()
+        index_after = (store / "index.jsonl").read_bytes()
+
+        next_session = self.payload(session_id="session-2", turn_id="turn-2", source="startup")
+        self.run_hook("SessionStart", next_session)
+        self.assertEqual((store / "resolutions.jsonl").read_bytes(), resolution_after)
+        self.assertEqual((store / "index.jsonl").read_bytes(), index_after)
+        self.assertEqual(standalone.read_text(encoding="utf-8"), "standalone sentinel\n")
+
+    def test_global_target_migration_fails_open_on_corrupt_jsonl(self) -> None:
+        store = self.codex_home / "codex-gardener-global-learning"
+        store.mkdir(parents=True)
+        path = store / "resolutions.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "fingerprint": "preserve-me",
+                    "target_path": "~/.codex/skills/cross-project-delegation/SKILL.md",
+                }
+            )
+            + "\nnot-json\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        before = path.read_bytes()
+
+        self.run_hook("SessionStart", self.payload(source="startup"))
+
+        self.assertEqual(path.read_bytes(), before)
 
     def test_records_repository_and_global_candidates_in_separate_stores(self) -> None:
         repository = gardener.record_candidate(self.candidate_args(session_id="repo-session"))
@@ -929,6 +1101,7 @@ class GardenerTest(unittest.TestCase):
             )
         group = gardener.aggregate_candidates(self.root, "global")[0]
         self.assertEqual(group["status"], "confirmed")
+        self.assertEqual(group["evidence_status"], "confirmed")
         self.assertEqual(group["occurrences"], 3)
         self.assertEqual(group["confidence"], 0.7)
 
@@ -1117,6 +1290,31 @@ class GardenerTest(unittest.TestCase):
         self.assertNotIn("session-1", rendered)
         self.assertNotIn(str(self.root), rendered)
 
+    def test_effectiveness_counts_effective_resolution_statuses(self) -> None:
+        promoted = gardener.record_candidate(self.candidate_args(session_id="promoted-session"))
+        discarded = gardener.record_candidate(
+            self.candidate_args(
+                session_id="discarded-session",
+                lesson="Do not retain obsolete parser workarounds.",
+            )
+        )
+        gardener.resolve_candidate(
+            self.resolution_args(fingerprint=promoted["fingerprint"], status="promoted")
+        )
+        gardener.resolve_candidate(
+            self.resolution_args(fingerprint=discarded["fingerprint"], status="discarded")
+        )
+
+        report = self.run_cli("effectiveness", "--repo", str(self.root), "--json")
+        self.assertEqual(
+            report["candidate_group_status"]["repository"],
+            {"discarded": 1, "promoted": 1},
+        )
+        self.assertEqual(
+            report["candidate_group_evidence_status"]["repository"],
+            {"candidate": 2},
+        )
+
     def test_effectiveness_health_reports_duplicate_enabled_gardener_plugins(self) -> None:
         self.codex_home.mkdir(parents=True, exist_ok=True)
         standalone = self.codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
@@ -1136,7 +1334,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.5.1")
+        self.assertEqual(report["health"]["plugin_version"], "0.5.2")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 

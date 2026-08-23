@@ -20,6 +20,8 @@ Automatic audits are read-only by contract. The curator may inspect local effect
 
 Effectiveness logs are local operational records, not a security boundary or tamper-proof audit trail. Their schema rejects fields outside a small allowlist and hashes correlating identifiers, but local users and processes with filesystem access can read, change, or delete them. Logging and rotation failures fail open so they never interrupt a Codex hook or Gardener CLI operation. Set `CODEX_GARDENER_EFFECTIVENESS_LOG=0` to disable these events.
 
+The v0.5.2 global metadata migration recognizes only the two exact historical cross-project delegation Skill targets, including their slash-equivalent Windows forms. It strictly parses the complete Gardener-owned JSONL file under a per-file lock before atomically replacing it; corrupt or unreadable data fails open without rewrite, and unrelated targets and standalone Skill files are not touched.
+
 Do not keep both `codex-gardener@personal` and `codex-gardener@codex-gardener` enabled: Codex may run matching Hooks from both installations. Version `0.4.0` reports this duplicate state and the cloned installer fails with an explicit removal command rather than deleting another installation. The health report prints local data, log, and standalone Skill paths for diagnosis; avoid publishing that report without reviewing those paths.
 
 This project is community-maintained and is not an official OpenAI product.

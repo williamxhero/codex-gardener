@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.5.1", "Plugin version must be 0.5.1")
+    require(data.get("version") == "0.5.2", "Plugin version must be 0.5.2")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -166,6 +166,15 @@ def validate_hygiene() -> None:
     require("CODEX_GARDENER_AUDIT_THRESHOLD" in gardener_source, "Knowledge audit review threshold is missing")
     require("CODEX_GARDENER_AUDIT_MAX_DAYS" in gardener_source, "Knowledge audit time threshold is missing")
     require("CODEX_GARDENER_RUN_KIND" in effectiveness_source, "Effectiveness run-kind classification is missing")
+    require('"evidence_status"' in gardener_source, "Candidate evidence maturity metadata is missing")
+    require(
+        '"candidate_group_evidence_status"' in gardener_source,
+        "Effectiveness evidence maturity summary is missing",
+    )
+    require(
+        "BUNDLED_DELEGATION_SKILL_TARGET" in gardener_source,
+        "Legacy delegation target metadata migration is missing",
+    )
     require("observation_status" in effectiveness_source, "Effectiveness health status is missing")
     require("legacy-user-learning-v1" in gardener_source, "Legacy user learning migration is missing")
     require("duplicate_enabled_plugin_ids" in gardener_source, "Duplicate plugin detection is missing")

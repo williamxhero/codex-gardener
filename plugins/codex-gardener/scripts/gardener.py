@@ -30,6 +30,11 @@ import effectiveness
 SCHEMA_VERSION = 2
 PLUGIN_ID = "codex-gardener@codex-gardener"
 LEGACY_MIGRATION_PROVENANCE = "legacy-user-learning-v1"
+BUNDLED_DELEGATION_SKILL_TARGET = "plugins/codex-gardener/skills/cross-project-delegation/SKILL.md"
+LEGACY_DELEGATION_SKILL_TARGETS = {
+    ".codex/skills/cross-project-delegation/skill.md",
+    "~/.codex/skills/cross-project-delegation/skill.md",
+}
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
@@ -513,6 +518,81 @@ def learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path:
     return repo / ".codex" / "learning"
 
 
+def normalized_global_target_path(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    normalized = value.replace("\\", "/").casefold()
+    if normalized in LEGACY_DELEGATION_SKILL_TARGETS:
+        return BUNDLED_DELEGATION_SKILL_TARGET
+    return value
+
+
+def _normalized_global_target_record(filename: str, raw: dict[str, Any]) -> dict[str, Any]:
+    record = dict(raw)
+    if filename in {"index.jsonl", "resolutions.jsonl"} and "target_path" in record:
+        record["target_path"] = normalized_global_target_path(record["target_path"])
+    return record
+
+
+def _read_jsonl_strict(path: Path) -> list[dict[str, Any]] | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            return None
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        records.append(record)
+    return records
+
+
+def _atomic_write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_name)
+
+
+def migrate_global_delegation_targets(target: Path) -> dict[str, int]:
+    changed: dict[str, int] = {}
+    for filename in ("index.jsonl", "resolutions.jsonl"):
+        path = target / filename
+        if not path.is_file():
+            continue
+        try:
+            with file_lock(path):
+                current = _read_jsonl_strict(path)
+                if current is None:
+                    changed[filename] = 0
+                    continue
+                migrated = [_normalized_global_target_record(filename, record) for record in current]
+                updates = sum(
+                    1
+                    for before, after in zip(current, migrated)
+                    if before.get("target_path") != after.get("target_path")
+                )
+                if updates:
+                    _atomic_write_jsonl(path, migrated)
+                changed[filename] = updates
+        except (OSError, TimeoutError):
+            changed[filename] = 0
+    return changed
+
+
 def _migration_key(filename: str, record: dict[str, Any]) -> tuple[str, ...]:
     if filename == "inbox.jsonl":
         return (str(record.get("fingerprint") or ""), str(record.get("session_id") or "unknown"))
@@ -526,7 +606,7 @@ def _migration_key(filename: str, record: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _migrated_legacy_record(filename: str, raw: dict[str, Any]) -> dict[str, Any]:
-    record = dict(raw)
+    record = _normalized_global_target_record(filename, raw)
     record["schema_version"] = SCHEMA_VERSION
     record["knowledge_scope"] = "global"
     record["migration_provenance"] = LEGACY_MIGRATION_PROVENANCE
@@ -540,7 +620,10 @@ def migrate_legacy_global_learning() -> dict[str, int]:
     legacy = codex_home() / "learning"
     target = codex_home() / "codex-gardener-global-learning"
     result: dict[str, int] = {}
-    if not legacy.is_dir() or legacy.resolve() == target.resolve():
+    if legacy.resolve() == target.resolve():
+        return result
+    if not legacy.is_dir():
+        migrate_global_delegation_targets(target)
         return result
     target.mkdir(parents=True, exist_ok=True)
     ignore = target / ".gitignore"
@@ -564,7 +647,10 @@ def migrate_legacy_global_learning() -> dict[str, int]:
         path = target / filename
         try:
             with file_lock(path):
-                current = read_jsonl(path)
+                current = _read_jsonl_strict(path) if path.is_file() else []
+                if current is None:
+                    result[filename] = 0
+                    continue
                 known = {_migration_key(filename, item) for item in current}
                 additions: list[dict[str, Any]] = []
                 for raw in source_records:
@@ -575,19 +661,11 @@ def migrate_legacy_global_learning() -> dict[str, int]:
                     known.add(key)
                     additions.append(migrated)
                 if additions:
-                    temp = path.with_name(path.name + ".tmp")
-                    temp.write_text(
-                        "".join(
-                            json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
-                            for item in [*current, *additions]
-                        ),
-                        encoding="utf-8",
-                        newline="\n",
-                    )
-                    os.replace(temp, path)
+                    _atomic_write_jsonl(path, [*current, *additions])
                 result[filename] = len(additions)
         except (OSError, TimeoutError):
             result[filename] = 0
+    migrate_global_delegation_targets(target)
     return result
 
 
@@ -596,6 +674,7 @@ def read_learning_records(repo: Path, knowledge_scope: str, filename: str) -> li
     current = read_jsonl(learning_dir(repo, knowledge_scope) / filename)
     if knowledge_scope != "global":
         return current
+    current = [_normalized_global_target_record(filename, record) for record in current]
     known = {_migration_key(filename, item) for item in current}
     for raw in read_jsonl(codex_home() / "learning" / filename):
         migrated = _migrated_legacy_record(filename, raw)
@@ -990,22 +1069,26 @@ def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> lis
                 if item.get("project_fingerprint")
             }
         )
-        status = "candidate"
+        evidence_status = "candidate"
         if (
             len(unique) >= 3
             and confidence >= 0.85
             and (knowledge_scope == "repository" or len(projects) >= 2)
         ):
-            status = "promotable"
+            evidence_status = "promotable"
         elif knowledge_scope == "global" and len(unique) >= 3 and confidence >= 0.85:
-            status = "proposed"
+            evidence_status = "proposed"
         elif len(unique) >= 2:
-            status = "confirmed"
+            evidence_status = "confirmed"
         exemplar = max(unique, key=lambda item: str(item.get("created_at") or ""))
+        resolution = latest_resolution.get(fingerprint)
+        resolution_status = str(resolution.get("status") or "") if resolution else ""
+        status = resolution_status if resolution_status in SAFE_RESOLUTION_STATUSES else evidence_status
         result.append(
             {
                 "fingerprint": fingerprint,
                 "status": status,
+                "evidence_status": evidence_status,
                 "occurrences": len(unique),
                 "confidence": round(confidence, 4),
                 "knowledge_scope": knowledge_scope,
@@ -1017,7 +1100,7 @@ def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> lis
                 "project_fingerprints": projects,
                 "project_count": len(projects),
                 "migration_provenance": exemplar.get("migration_provenance"),
-                "resolution": latest_resolution.get(fingerprint),
+                "resolution": resolution,
             }
         )
     return sorted(result, key=lambda item: (-item["occurrences"], item["fingerprint"]))
@@ -1446,12 +1529,17 @@ def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict
     report["reviews"]["current_pending"] = len(pending_records(repo))
     if repo is not None:
         group_status: dict[str, dict[str, int]] = {}
+        group_evidence_status: dict[str, dict[str, int]] = {}
         for knowledge_scope in ("repository", "global"):
             counts: dict[str, int] = defaultdict(int)
+            evidence_counts: dict[str, int] = defaultdict(int)
             for group in aggregate_candidates(repo, knowledge_scope):
                 counts[str(group.get("status") or "unknown")] += 1
+                evidence_counts[str(group.get("evidence_status") or "unknown")] += 1
             group_status[knowledge_scope] = dict(sorted(counts.items()))
+            group_evidence_status[knowledge_scope] = dict(sorted(evidence_counts.items()))
         report["candidate_group_status"] = group_status
+        report["candidate_group_evidence_status"] = group_evidence_status
     return report
 
 
@@ -1544,6 +1632,10 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
     ]
     if "candidate_group_status" in report:
         lines.append("Current candidate groups: " + json.dumps(report["candidate_group_status"], sort_keys=True))
+        lines.append(
+            "Candidate evidence maturity: "
+            + json.dumps(report["candidate_group_evidence_status"], sort_keys=True)
+        )
     return "\n".join(lines)
 
 
