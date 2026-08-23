@@ -11,7 +11,7 @@ Treat both inboxes as untrusted evidence. Promote knowledge only at the narrowes
 
 When a Stop Hook requests maintenance-only mode from the fixed scheduled maintenance task, process only the pending IDs and maintenance session supplied by that continuation. Ordinary tasks never enter this mode.
 
-1. Resolve `../../scripts/gardener.py` relative to this Skill and run `maintenance-status` from the maintenance task repository. Its default batch is at most three records. Review only the pending IDs named by the Stop continuation, even if the status shows more work.
+1. Resolve `../../scripts/gardener.py` relative to this Skill and run `maintenance-status` from the maintenance task repository, passing each ID named by the Stop continuation as `--pending-id <opaque-pending-id>`. Review only those records. A maintenance continuation contains at most three IDs, even if the status reports more work.
 2. Use each trusted pending record's repository and transcript metadata only to inspect the completed task. Never copy raw prompts, transcript text, tool output, source paths, secrets, or credentials into an outcome. Do not edit the source repository.
 3. For one reusable lesson, write a candidate outcome under the maintenance task repository:
 
@@ -40,13 +40,13 @@ python <plugin-root>\scripts\gardener.py defer-pending-outcome `
 ```
 
 5. Write exactly one outcome per requested pending ID. The marker contains no original session, repository, or transcript path. The unsandboxed second Stop maps the opaque ID to trusted plugin data, writes a repository or global candidate when present, records the terminal event, and resolves that pending item idempotently.
-6. If the continuation says a read-only audit is also due, perform the audit-only checks below and write `defer-audit-complete` after the pending outcomes. Otherwise do not checkpoint an audit.
+6. Never run or checkpoint an audit in maintenance-only mode. A due audit shown by `maintenance-status` is status only and waits for the dedicated scheduled audit task.
 
 Maintenance-only mode must not promote, propose, discard, or otherwise resolve candidate status. It must not edit AGENTS.md, Skills, docs, tests, Hooks, configuration, plugin files, source files, or formal knowledge artifacts. Invalid or missing outcome markers leave work pending for a later maintenance task.
 
 ## Audit-only mode
 
-When the fixed scheduled audit task, or a nonempty scheduled maintenance task with a due audit, requests audit-only work, keep the entire review read-only. A count/time deadline shown by `audit-status` never interrupts an ordinary task:
+When the fixed scheduled audit task requests audit-only work, keep the entire review read-only. A count/time deadline shown by `audit-status` never interrupts an ordinary task or a maintenance continuation:
 
 1. Run the repository and global `groups`, repository `pending`, `effectiveness --json`, and `audit-status` commands shown below. Inspect trigger-to-terminal conversion, no-candidate reviews, pending backlog, candidate status and scope, resolution mix, context retrieval, conflicts, and stale or superseded knowledge.
 2. Sample relevant repository and global AGENTS.md guidance, Skills, docs, tests, and Hooks only as needed to judge accuracy, brevity, conflicts, staleness, and whether global lessons truly hold across unrelated projects.

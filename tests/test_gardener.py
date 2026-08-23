@@ -310,6 +310,41 @@ class GardenerTest(unittest.TestCase):
             {"continue": True},
         )
 
+    def test_concurrent_maintenance_claims_are_disjoint_and_stale_claims_expire(self) -> None:
+        for index in range(6):
+            self.queue_pending(f"claim-source-{index}", self.root)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(gardener.claim_pending_records, "maintenance-a")
+            second_future = pool.submit(gardener.claim_pending_records, "maintenance-b")
+            first = first_future.result()
+            second = second_future.result()
+
+        first_ids = {item["pending_id"] for item in first}
+        second_ids = {item["pending_id"] for item in second}
+        self.assertEqual(len(first_ids), 3)
+        self.assertEqual(len(second_ids), 3)
+        self.assertFalse(first_ids & second_ids)
+
+        records = gardener.read_jsonl(gardener.pending_path())
+        for record in records:
+            if record.get("record_type") == "claim":
+                record["created_at"] = "2026-01-01T00:00:00Z"
+        gardener._atomic_write_jsonl(gardener.pending_path(), records)
+        reclaimed = gardener.claim_pending_records("maintenance-c")
+        self.assertEqual(len(reclaimed), 3)
+
+    def test_structurally_corrupt_pending_objects_do_not_starve_maintenance(self) -> None:
+        path = gardener.pending_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n{}\n{}\n", encoding="utf-8")
+        pending = self.queue_pending("valid-after-corruption", self.root)
+
+        _, requested = self.start_maintenance(session_id="maintenance-after-corruption")
+
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn(pending["pending_id"], requested["reason"])
+
     def test_maintenance_status_returns_a_bounded_batch_and_audit_status(self) -> None:
         for index in range(4):
             self.queue_pending(f"maintenance-status-{index}", self.root)
@@ -323,15 +358,20 @@ class GardenerTest(unittest.TestCase):
             [item["pending_id"] for item in gardener.pending_records()[:3]],
         )
         self.assertIn("due", status["audit"])
+        selected = status["batch"][1]["pending_id"]
+        filtered = self.run_cli("maintenance-status", "--pending-id", selected)
+        self.assertEqual([item["pending_id"] for item in filtered["batch"]], [selected])
 
-    def test_due_audit_is_picked_up_by_the_next_nonempty_maintenance_run(self) -> None:
+    def test_due_audit_remains_status_only_during_nonempty_maintenance(self) -> None:
         self.run_cli("audit-status", "--initialize")
         for index in range(10):
             self.log_completed_review(f"maintenance-audit-{index}")
         pending = self.queue_pending("source-audit-maintenance", self.root)
         maintenance, requested = self.start_maintenance(session_id="maintenance-with-audit")
         self.assertEqual(requested["decision"], "block")
-        self.assertIn("read-only audit is also due", requested["reason"])
+        self.assertNotIn("read-only audit", requested["reason"].casefold())
+        state = gardener.load_json_file(gardener.state_path("maintenance-with-audit"), {})
+        self.assertFalse(state["audit_requested"])
 
         self.run_cli(
             "defer-pending-outcome",
@@ -344,19 +384,13 @@ class GardenerTest(unittest.TestCase):
             "--outcome",
             "no-candidate",
         )
-        self.run_cli(
-            "defer-audit-complete",
-            "--repo",
-            str(self.other),
-            "--session-id",
-            "maintenance-with-audit",
-        )
 
         self.assertEqual(
             self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
             {"continue": True},
         )
-        self.assertFalse(self.run_cli("audit-status")["due"])
+        self.assertTrue(self.run_cli("audit-status")["due"])
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
 
     def test_maintenance_deferred_repository_candidate_uses_trusted_pending_mapping_once(self) -> None:
         pending = self.queue_pending("source-repository", self.root)
@@ -447,6 +481,66 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(global_records[0]["session_id"], "source-global")
         self.assertFalse((self.root / ".codex" / "learning" / "inbox.jsonl").exists())
 
+    def test_concurrent_second_stops_commit_only_one_pending_outcome(self) -> None:
+        pending = self.queue_pending("source-concurrent-outcome", self.root)
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-candidate",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "candidate",
+            "--knowledge-scope",
+            "repository",
+            "--scope",
+            "concurrency",
+            "--lesson",
+            "Serialize pending outcomes by opaque identifier.",
+            "--evidence",
+            "Concurrent maintenance must commit one terminal result.",
+            "--target",
+            "test",
+            "--confidence",
+            "0.9",
+        )
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-empty",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "no-candidate",
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda session: gardener.consume_deferred_pending_outcomes(
+                        self.other, session, [pending["pending_id"]]
+                    ),
+                    ("maintenance-candidate", "maintenance-empty"),
+                )
+            )
+
+        self.assertEqual(sum(processed for processed, _ in results), 1)
+        self.assertEqual(gardener.pending_records(), [])
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(
+            report["reviews"]["captures_recorded"]
+            + report["reviews"]["completed_without_candidate"],
+            1,
+        )
+        self.assertLessEqual(
+            len(gardener.read_learning_records(self.root, "repository", "inbox.jsonl")),
+            1,
+        )
+
     def test_maintenance_no_candidate_resolves_pending_and_logs_terminal_once(self) -> None:
         pending = self.queue_pending("source-empty", self.root)
         maintenance, _ = self.start_maintenance(session_id="maintenance-empty-outcome")
@@ -496,28 +590,25 @@ class GardenerTest(unittest.TestCase):
                 "created_at": gardener.utc_now(),
             },
         )
-        self.run_cli(
-            "defer-pending-outcome",
-            "--repo",
-            str(self.other),
-            "--session-id",
-            "maintenance-invalid",
-            "--pending-id",
-            pending["pending_id"],
-            "--outcome",
-            "candidate",
-            "--knowledge-scope",
-            "repository",
-            "--scope",
-            "privacy",
-            "--lesson",
-            "Keep maintenance handoffs path-free.",
-            "--evidence",
-            f"Copied from {self.root}",
-            "--target",
-            "docs",
-            "--confidence",
-            "0.9",
+        gardener.atomic_write_json(
+            deferred_dir / f"{pending['pending_id']}.json",
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "record_type": "deferred_pending_outcome",
+                "maintenance_session_id": "maintenance-invalid",
+                "pending_id": pending["pending_id"],
+                "outcome": "candidate",
+                "created_at": gardener.utc_now(),
+                "fingerprint": gardener.candidate_fingerprint(
+                    "privacy", "Keep maintenance handoffs path-free.", "docs"
+                ),
+                "knowledge_scope": "repository",
+                "scope": "privacy",
+                "lesson": "Keep maintenance handoffs path-free.",
+                "evidence_summary": f"Copied from {self.root}",
+                "recommended_target": "docs",
+                "confidence": 0.9,
+            },
         )
 
         self.assertEqual(
@@ -525,6 +616,48 @@ class GardenerTest(unittest.TestCase):
             {"continue": True},
         )
         self.assertEqual([item["pending_id"] for item in gardener.pending_records()], [pending["pending_id"]])
+        self.assertFalse(any(deferred_dir.glob("*.json")))
+
+    def test_defer_pending_outcome_rejects_source_identifiers_before_writing(self) -> None:
+        pending = self.queue_pending("source-private-session", self.root)
+        self.start_maintenance(session_id="maintenance-private")
+        for evidence in (f"Copied from {self.root}", "Observed in source-private-session"):
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "defer-pending-outcome",
+                    "--repo",
+                    str(self.other),
+                    "--session-id",
+                    "maintenance-private",
+                    "--pending-id",
+                    pending["pending_id"],
+                    "--outcome",
+                    "candidate",
+                    "--knowledge-scope",
+                    "repository",
+                    "--scope",
+                    "privacy",
+                    "--lesson",
+                    "Keep maintenance handoffs private.",
+                    "--evidence",
+                    evidence,
+                    "--target",
+                    "docs",
+                    "--confidence",
+                    "0.9",
+                ],
+                cwd=self.root,
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("must not contain source identifiers or paths", result.stderr)
+        self.assertFalse(any(gardener.deferred_maintenance_dir(self.other, "maintenance-private").glob("*.json")))
 
     def test_legacy_pending_record_gets_a_stable_id_and_can_be_completed_by_maintenance(self) -> None:
         legacy = {
@@ -922,6 +1055,20 @@ class GardenerTest(unittest.TestCase):
         rendered = json.dumps(pending)
         self.assertNotIn("private tool payload", rendered)
         self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["pending_queued"], 1)
+
+    def test_pending_lock_failure_does_not_fail_stop_or_session_end(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "PostToolUse",
+            self.payload(tool_name="apply_patch", tool_input={}, tool_response={"status": "ok"}),
+        )
+        with patch.object(gardener, "queue_pending_review", side_effect=TimeoutError("busy")):
+            self.assertEqual(
+                self.run_hook("Stop", self.payload(stop_hook_active=False)),
+                {"continue": True},
+            )
+            self.assertEqual(self.run_hook("SessionEnd", self.payload(reason="other")), {})
+        self.assertFalse(gardener.state_path("session-1").exists())
 
     def test_due_audit_never_interrupts_an_ordinary_task(self) -> None:
         self.run_cli("audit-status", "--initialize")

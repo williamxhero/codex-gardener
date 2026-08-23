@@ -47,6 +47,7 @@ AUDIT_MAX_DAYS_ENV = "CODEX_GARDENER_AUDIT_MAX_DAYS"
 DEFAULT_AUDIT_THRESHOLD = 10
 DEFAULT_AUDIT_MAX_DAYS = 7
 DEFAULT_MAINTENANCE_BATCH = 3
+PENDING_CLAIM_TTL_SECONDS = 60 * 60
 SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
 SCHEDULED_MAINTENANCE_MARKER = "[codex-gardener:scheduled-maintenance]"
 AUDIT_REASONS = {"review_threshold", "elapsed_time", "forced", "scheduled"}
@@ -807,6 +808,9 @@ def defer_pending_outcome(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("pending-id must be a 32-character lowercase hex identifier")
     if outcome not in {"candidate", "no-candidate"}:
         raise ValueError("outcome must be candidate or no-candidate")
+    pending = next((item for item in pending_records() if item.get("pending_id") == pending_id), None)
+    if pending is None:
+        raise ValueError("pending-id does not identify active Gardener work")
     marker: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "record_type": "deferred_pending_outcome",
@@ -817,6 +821,19 @@ def defer_pending_outcome(args: argparse.Namespace) -> dict[str, Any]:
     }
     if outcome == "candidate":
         fields = normalized_candidate_fields(args)
+        marker_text = "\n".join(
+            str(fields[field]) for field in ("scope", "lesson", "evidence")
+        ).replace("\\", "/").casefold()
+        sensitive_values = (
+            pending.get("session_id"),
+            pending.get("repo_root") or pending.get("cwd"),
+            pending.get("transcript_path"),
+        )
+        if any(
+            value and str(value).replace("\\", "/").casefold() in marker_text
+            for value in sensitive_values
+        ):
+            raise ValueError("deferred pending outcome must not contain source identifiers or paths")
         marker.update(
             {
                 "fingerprint": candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"]),
@@ -1295,6 +1312,22 @@ def pending_identity(record: dict[str, Any]) -> str:
     return sha256_text(f"legacy-pending\0{session_id}\0{project}\0{created_at}")[:32]
 
 
+def valid_pending_record(record: dict[str, Any]) -> bool:
+    if record.get("record_type", "pending") != "pending":
+        return False
+    session_id = str(record.get("session_id") or "")
+    project = str(record.get("repo_root") or record.get("cwd") or "")
+    signals = record.get("signals")
+    run_kind = record.get("run_kind")
+    return (
+        0 < len(session_id) <= 256
+        and 0 < len(project) <= 4096
+        and parse_utc(record.get("created_at")) is not None
+        and (signals is None or (isinstance(signals, list) and all(isinstance(item, str) for item in signals)))
+        and (run_kind is None or run_kind in {"real", "smoke"})
+    )
+
+
 def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     resolved_ids = {
         str(record.get("pending_id"))
@@ -1312,7 +1345,7 @@ def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
     seen: set[str] = set()
     seen_sources: set[tuple[str, str]] = set()
     for raw in records:
-        if raw.get("record_type", "pending") != "pending":
+        if not valid_pending_record(raw):
             continue
         pending_id = pending_identity(raw)
         session_id = str(raw.get("session_id") or "")
@@ -1335,6 +1368,32 @@ def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
     return active
 
 
+def active_pending_claims(
+    records: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, str]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    active_ids = {record["pending_id"] for record in active_pending_records(records)}
+    claims: dict[str, str] = {}
+    for record in records:
+        if record.get("record_type") != "claim":
+            continue
+        pending_id = str(record.get("pending_id") or "")
+        owner = str(record.get("claim_owner") or "")
+        claimed_at = parse_utc(record.get("created_at"))
+        if (
+            pending_id not in active_ids
+            or not re.fullmatch(r"[0-9a-f]{32}", pending_id)
+            or not re.fullmatch(r"[0-9a-f]{24}", owner)
+            or claimed_at is None
+            or (current - claimed_at).total_seconds() >= PENDING_CLAIM_TTL_SECONDS
+        ):
+            continue
+        claims[pending_id] = owner
+    return claims
+
+
 def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
     records = active_pending_records(read_jsonl(pending_path()))
     if repo is None:
@@ -1343,14 +1402,66 @@ def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
     return [record for record in records if str(record.get("repo_root") or record.get("cwd") or "").casefold() == wanted]
 
 
-def maintenance_status(limit: int = DEFAULT_MAINTENANCE_BATCH) -> dict[str, Any]:
+def claim_pending_records(
+    maintenance_session_id: str,
+    limit: int = DEFAULT_MAINTENANCE_BATCH,
+) -> list[dict[str, Any]]:
+    if not 1 <= limit <= DEFAULT_MAINTENANCE_BATCH:
+        raise ValueError(f"maintenance batch limit must be between 1 and {DEFAULT_MAINTENANCE_BATCH}")
+    owner = safe_name(maintenance_session_id)
+    path = pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        records = read_jsonl(path)
+        active = active_pending_records(records)
+        claims = active_pending_claims(records)
+        selected = [record for record in active if claims.get(record["pending_id"]) == owner]
+        available = [record for record in active if record["pending_id"] not in claims]
+        selected.extend(available[: max(0, limit - len(selected))])
+        selected = selected[:limit]
+        new_claims = [record for record in selected if record["pending_id"] not in claims]
+        if new_claims:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                for record in new_claims:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "record_type": "claim",
+                                "pending_id": record["pending_id"],
+                                "claim_owner": owner,
+                                "created_at": utc_now(),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+    return selected
+
+
+def maintenance_status(
+    limit: int = DEFAULT_MAINTENANCE_BATCH,
+    pending_ids: list[str] | None = None,
+) -> dict[str, Any]:
     if not 1 <= limit <= 10:
         raise ValueError("maintenance batch limit must be between 1 and 10")
     pending = pending_records()
+    if pending_ids:
+        if len(pending_ids) > DEFAULT_MAINTENANCE_BATCH or any(
+            not re.fullmatch(r"[0-9a-f]{32}", value) for value in pending_ids
+        ):
+            raise ValueError("maintenance status accepts at most three valid pending IDs")
+        requested = set(pending_ids)
+        batch = [record for record in pending if record["pending_id"] in requested]
+    else:
+        batch = pending[:limit]
     return {
         "pending_count": len(pending),
         "batch_limit": limit,
-        "batch": pending[:limit],
+        "batch": batch,
         "audit": audit_status(initialize=True),
     }
 
@@ -1505,40 +1616,56 @@ def consume_deferred_pending_outcomes(
             or parse_utc(marker.get("created_at")) is None
         ):
             invalid += 1
+            with contextlib.suppress(OSError):
+                marker_path.unlink()
             continue
         pending_id = str(marker["pending_id"])
-        pending = next((item for item in pending_records() if item.get("pending_id") == pending_id), None)
-        raw_repo = (pending.get("repo_root") or pending.get("cwd")) if pending else None
-        if pending is None or not raw_repo:
-            invalid += 1
-            continue
-        source_repo = Path(str(raw_repo)).resolve()
-        if not source_repo.is_dir():
-            invalid += 1
-            continue
-        marker_text = "\n".join(
-            str(marker.get(field) or "")
-            for field in ("scope", "lesson", "evidence_summary")
-        ).replace("\\", "/").casefold()
-        sensitive_paths = [str(raw_repo), str(pending.get("transcript_path") or "")]
-        if any(
-            value and value.replace("\\", "/").casefold() in marker_text
-            for value in sensitive_paths
-        ):
-            invalid += 1
-            continue
+        guard = plugin_data_root() / "pending-outcome-guards" / pending_id
+        guard.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if marker["outcome"] == "candidate":
-                args = candidate_args_from_pending_marker(source_repo, pending, marker)
-                record_candidate(args)
-            elif set(marker) != common_allowed:
-                raise ValueError("no-candidate deferred outcome contains candidate fields")
-            resolved = resolve_pending_record(pending)
-        except (OSError, TimeoutError, TypeError, ValueError):
+            with file_lock(guard):
+                pending = next(
+                    (item for item in pending_records() if item.get("pending_id") == pending_id),
+                    None,
+                )
+                raw_repo = (pending.get("repo_root") or pending.get("cwd")) if pending else None
+                if pending is None or not raw_repo:
+                    with contextlib.suppress(OSError):
+                        marker_path.unlink()
+                    continue
+                source_repo = Path(str(raw_repo)).resolve()
+                if not source_repo.is_dir():
+                    raise ValueError("pending source repository is unavailable")
+                marker_text = "\n".join(
+                    str(marker.get(field) or "")
+                    for field in ("scope", "lesson", "evidence_summary")
+                ).replace("\\", "/").casefold()
+                sensitive_values = (
+                    pending.get("session_id"),
+                    raw_repo,
+                    pending.get("transcript_path"),
+                )
+                if any(
+                    value and str(value).replace("\\", "/").casefold() in marker_text
+                    for value in sensitive_values
+                ):
+                    raise ValueError("deferred pending outcome contains source identifiers or paths")
+                if marker["outcome"] == "candidate":
+                    args = candidate_args_from_pending_marker(source_repo, pending, marker)
+                    record_candidate(args)
+                elif set(marker) != common_allowed:
+                    raise ValueError("no-candidate deferred outcome contains candidate fields")
+                resolved = resolve_pending_record(pending)
+        except (OSError, TimeoutError):
             invalid += 1
+            continue
+        except (TypeError, ValueError):
+            invalid += 1
+            with contextlib.suppress(OSError):
+                marker_path.unlink()
             continue
         if not resolved:
-            with contextlib.suppress(FileNotFoundError):
+            with contextlib.suppress(OSError):
                 marker_path.unlink()
             continue
         if marker["outcome"] == "no-candidate":
@@ -1548,7 +1675,7 @@ def consume_deferred_pending_outcomes(
                 project=project_identity(source_repo),
                 run_kind=str(pending.get("run_kind") or effectiveness.current_run_kind()),
             )
-        with contextlib.suppress(FileNotFoundError):
+        with contextlib.suppress(OSError):
             marker_path.unlink()
         processed += 1
     with contextlib.suppress(OSError):
@@ -1685,10 +1812,15 @@ def handle_stop(payload: dict[str, Any]) -> None:
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
     repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
     continuation_kind = str(state.get("continuation_kind") or "")
-    audit_processed, audit_invalid = consume_deferred_audits(
-        repo,
-        session_id,
-        str(state.get("audit_reason") or "scheduled"),
+    audit_expected = bool(state.get("force_audit") or state.get("audit_requested") or continuation_kind == "audit")
+    audit_processed, audit_invalid = (
+        consume_deferred_audits(
+            repo,
+            session_id,
+            str(state.get("audit_reason") or "scheduled"),
+        )
+        if audit_expected
+        else (0, 0)
     )
     if audit_invalid:
         log_effectiveness("operation_error", operation="audit", category="input")
@@ -1747,8 +1879,14 @@ def handle_stop(payload: dict[str, Any]) -> None:
         and not state.get("capture_completed")
         and not state.get("force_maintenance")
     ):
+        try:
+            pending, created = queue_pending_review(state, payload)
+        except (OSError, TimeoutError):
+            log_effectiveness("operation_error", operation="pending", category="storage")
+            save_state(path, state)
+            emit_json({"continue": True})
+            return
         state["review_requested"] = True
-        pending, created = queue_pending_review(state, payload)
         state["pending_id"] = pending["pending_id"]
         save_state(path, state)
         if created:
@@ -1765,38 +1903,31 @@ def handle_stop(payload: dict[str, Any]) -> None:
         emit_json({"continue": True})
         return
     if state.get("force_maintenance") and not state.get("force_audit"):
-        batch = pending_records()[:DEFAULT_MAINTENANCE_BATCH]
-        if not batch or state.get("continuation_kind") == "maintenance":
+        if state.get("continuation_kind") == "maintenance":
+            save_state(path, state)
+            emit_json({"continue": True})
+            return
+        try:
+            batch = claim_pending_records(session_id)
+        except (OSError, TimeoutError):
+            log_effectiveness("operation_error", operation="pending", category="storage")
+            save_state(path, state)
+            emit_json({"continue": True})
+            return
+        if not batch:
             save_state(path, state)
             emit_json({"continue": True})
             return
         pending_ids = [str(record["pending_id"]) for record in batch]
         state["maintenance_pending_ids"] = pending_ids
         state["continuation_kind"] = "maintenance"
-        maintenance_audit = audit_status(initialize=True)
-        audit_due = effectiveness.current_run_kind() == "real" and bool(maintenance_audit.get("due"))
-        if audit_due:
-            state["audit_requested"] = True
-            state["audit_reason"] = str(maintenance_audit.get("reason") or "scheduled")
-            log_effectiveness(
-                "audit_requested",
-                session=session_identity(session_id),
-                project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
-                audit_reason=state["audit_reason"],
-            )
         save_state(path, state)
         repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
-        audit_instruction = (
-            "A read-only audit is also due; perform the Skill's audit-only checks and defer its completion. "
-            if audit_due
-            else ""
-        )
         reason = (
             "Use $codex-gardener:knowledge-curator now in maintenance-only mode. "
             f"Maintenance session ID: {session_id}. Maintenance repository: {repository}. "
             f"Review only these pending IDs (maximum {DEFAULT_MAINTENANCE_BATCH}): {', '.join(pending_ids)}. "
             "For each ID, write exactly one sandbox-safe deferred pending outcome described by the Skill. "
-            f"{audit_instruction}"
             "Do not promote or resolve candidate status, and do not edit AGENTS.md, Skills, docs, tests, Hooks, "
             "configuration, plugin files, or any source repository."
         )
@@ -1842,19 +1973,23 @@ def handle_session_end(payload: dict[str, Any]) -> None:
         and not state.get("force_audit")
         and continuation_kind not in {"maintenance", "audit"}
     ):
-        state["review_requested"] = True
-        pending, created = queue_pending_review(state, payload)
-        state["pending_id"] = pending["pending_id"]
-        if created:
-            session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
-            project = project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None
-            common = {
-                "session": session_identity(session_id),
-                "project": project,
-                "signals": safe_signal_categories(state),
-            }
-            log_effectiveness("review_requested", **common)
-            log_effectiveness("pending_queued", **common)
+        try:
+            pending, created = queue_pending_review(state, payload)
+        except (OSError, TimeoutError):
+            log_effectiveness("operation_error", operation="pending", category="storage")
+        else:
+            state["review_requested"] = True
+            state["pending_id"] = pending["pending_id"]
+            if created:
+                session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
+                project = project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None
+                common = {
+                    "session": session_identity(session_id),
+                    "project": project,
+                    "signals": safe_signal_categories(state),
+                }
+                log_effectiveness("review_requested", **common)
+                log_effectiveness("pending_queued", **common)
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
 
@@ -2068,6 +2203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     maintenance = sub.add_parser("maintenance-status")
     maintenance.add_argument("--limit", type=int, default=DEFAULT_MAINTENANCE_BATCH)
+    maintenance.add_argument("--pending-id", action="append")
 
     return parser
 
@@ -2114,7 +2250,7 @@ def main() -> int:
         elif args.command == "audit-status":
             emit_json(audit_status(initialize=True))
         elif args.command == "maintenance-status":
-            emit_json(maintenance_status(args.limit))
+            emit_json(maintenance_status(args.limit, args.pending_id))
         return 0
     except (OSError, ValueError, TimeoutError) as exc:
         sys.stderr.write(f"codex-gardener: {exc}\n")

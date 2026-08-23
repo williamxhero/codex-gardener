@@ -8,7 +8,7 @@ Lifecycle hooks receive Codex hook event JSON on standard input. The plugin deri
 
 The plugin may store:
 
-- short-lived task state and a pending-review queue under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`; new pending records use an opaque stable ID and bounded signal metadata;
+- short-lived task state and a pending-review queue under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`; new pending records use an opaque stable ID and bounded signal metadata, while maintenance claims add only that ID, a hashed claim owner, and a timestamp;
 - repository paths, task/session identifiers, signal names, timestamps, and—when Codex supplies it—a local transcript path, but not transcript contents;
 - repository-scoped candidate summaries, resolutions, and indexes under `<repository>/.codex/learning/`;
 - short-lived, ignored deferred candidate markers under `<repository>/.codex/learning/deferred-captures/` until the second Stop Hook consumes them;
@@ -28,7 +28,7 @@ Deferred markers contain the same concise candidate fields except repository pat
 
 Deferred audit markers contain only schema/type, session ID, a random completion ID, validated run kind, and creation time; they contain no audit findings or paths. The checkpoint contains initialization/completion times plus hashed successful-audit session and completion identities, but no prompt, transcript, findings, repository path, or raw session ID. The exact scheduled prompt marker is reduced immediately to a boolean session signal; prompt text is not persisted.
 
-Deferred maintenance markers contain the maintenance session ID, opaque pending ID, outcome type, creation time, and—only for a candidate—the same bounded lesson fields used by capture. They never contain the original task session, repository path, transcript path, prompt, or tool output. The unsandboxed Stop Hook accepts only IDs in the requested bounded batch, maps them to trusted pending data, and derives repository/global destinations itself. The exact maintenance prompt marker is also reduced immediately to a boolean.
+Deferred maintenance markers contain the maintenance session ID, opaque pending ID, outcome type, creation time, and—only for a candidate—the same bounded lesson fields used by capture. Before writing, the CLI cross-checks the active pending record and rejects lesson text containing its source session, repository path, or transcript path; Stop repeats that validation before accepting a marker. Markers never contain those original identifiers, prompts, or tool output. The unsandboxed Stop Hook accepts only IDs in the requested bounded batch, maps them to trusted pending data, and derives repository/global destinations itself. The exact maintenance prompt marker is also reduced immediately to a boolean.
 
 The JSONL filenames are listed in a `.gitignore` inside each learning store. They remain local unless you deliberately inspect, copy, sync, or commit them. Promoted repository knowledge may become repository files after review. Promoted global knowledge may become `$CODEX_HOME/AGENTS.md` or a Skill under `$CODEX_HOME/skills/`, but only after the curator proposes the exact change and receives explicit user confirmation.
 

@@ -58,7 +58,7 @@
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook Stop",
             "commandWindows": "cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\codex-gardener-hook.cmd gardener Stop",
-            "timeout": 5,
+            "timeout": 15,
             "statusMessage": "Checking for reusable knowledge"
           }
         ]

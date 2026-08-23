@@ -16,6 +16,13 @@ class PackagedPolicyTest(unittest.TestCase):
         )
         self.assertEqual(manifest["version"], "0.6.0")
 
+    def test_stop_timeout_covers_bounded_maintenance_processing(self) -> None:
+        hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+        stop = hooks["Stop"][0]["hooks"][0]
+        session_end = hooks["SessionEnd"][0]["hooks"][0]
+        self.assertEqual(stop["timeout"], 15)
+        self.assertEqual(session_end["timeout"], 3)
+
     def test_delegation_skill_requires_isolated_concurrent_writers(self) -> None:
         skill = (
             PLUGIN / "skills" / "cross-project-delegation" / "SKILL.md"
@@ -72,6 +79,7 @@ class PackagedPolicyTest(unittest.TestCase):
             "must not promote",
             "must not edit agents.md",
             "marker contains no original session, repository, or transcript path",
+            "never run or checkpoint an audit in maintenance-only mode",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)

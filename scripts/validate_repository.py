@@ -92,12 +92,15 @@ def validate_hooks() -> None:
     expected = {"PreToolUse", "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"}
     require(set(hooks) == expected, "Hook lifecycle events are incomplete or unexpected")
     for event, entries in hooks.items():
-        command = entries[0]["hooks"][0].get("commandWindows", "")
+        hook = entries[0]["hooks"][0]
+        command = hook.get("commandWindows", "")
         require('"' not in command, f"Windows Hook command must not contain embedded quotes: {event}")
         require(
             command.startswith("cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\codex-gardener-hook.cmd "),
             f"Windows Hook command must use the quote-free wrapper launcher: {event}",
         )
+        expected_timeout = 15 if event == "Stop" else 3
+        require(hook.get("timeout") == expected_timeout, f"Unexpected Hook timeout for {event}")
     rendered = path.read_text(encoding="utf-8")
     for script in ("gardener.py", "project_boundary.py"):
         require(script in rendered and (PLUGIN / "scripts" / script).is_file(), f"Hook script is missing: {script}")
