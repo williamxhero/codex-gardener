@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/project_boundary.py\"",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\project_boundary.py\"",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m project_boundary",
             "timeout": 3,
             "statusMessage": "Checking project ownership boundary"
           }
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook SessionStart",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook SessionStart",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook SessionStart",
             "timeout": 3,
             "statusMessage": "Starting Codex Gardener"
           }
@@ -33,7 +33,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook UserPromptSubmit",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook UserPromptSubmit",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook UserPromptSubmit",
             "timeout": 3
           }
         ]
@@ -45,7 +45,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook PostToolUse",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook PostToolUse",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook PostToolUse",
             "timeout": 3
           }
         ]
@@ -57,7 +57,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook Stop",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook Stop",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook Stop",
             "timeout": 5,
             "statusMessage": "Checking for reusable knowledge"
           }
@@ -70,7 +70,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/gardener.py\" hook SessionEnd",
-            "commandWindows": "python \"%PLUGIN_ROOT%\\scripts\\gardener.py\" hook SessionEnd",
+            "commandWindows": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook SessionEnd",
             "timeout": 3
           }
         ]
