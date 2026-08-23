@@ -1928,7 +1928,11 @@ def handle_stop(payload: dict[str, Any]) -> None:
         save_state(path, state)
         emit_json({"continue": True})
         return
-    if state.get("force_maintenance") and not state.get("force_audit"):
+    if (
+        state.get("force_maintenance")
+        and not state.get("force_audit")
+        and not conditional_due
+    ):
         if state.get("continuation_kind") == "maintenance":
             save_state(path, state)
             emit_json({"continue": True})
@@ -1942,9 +1946,8 @@ def handle_stop(payload: dict[str, Any]) -> None:
             return
         if not batch:
             save_state(path, state)
-            if not conditional_due:
-                emit_json({"continue": True})
-                return
+            emit_json({"continue": True})
+            return
         else:
             pending_ids = [str(record["pending_id"]) for record in batch]
             state["maintenance_pending_ids"] = pending_ids

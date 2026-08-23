@@ -88,7 +88,7 @@ class PackagedPolicyTest(unittest.TestCase):
         skill = (PLUGIN / "skills" / "knowledge-curator" / "SKILL.md").read_text(encoding="utf-8").casefold()
         self.assertIn("[codex-gardener:scheduled-audit-check]", skill)
         self.assertIn("only when the audit status is due", skill)
-        self.assertIn("maintenance takes priority", skill)
+        self.assertIn("a due audit takes priority", skill)
 
 
 if __name__ == "__main__":

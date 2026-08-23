@@ -1137,11 +1137,35 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(result, {"continue": True})
         self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
 
-    def test_combined_maintenance_and_audit_check_prioritizes_pending_work(self) -> None:
+    def test_combined_maintenance_and_due_audit_check_prioritizes_audit(self) -> None:
         pending = self.queue_pending("source-session")
         self.run_cli("audit-status", "--initialize")
         for index in range(10):
-            self.log_completed_review(f"maintenance-priority-{index}")
+            self.log_completed_review(f"audit-priority-{index}")
+        maintenance = self.payload(
+            session_id="maintenance-session",
+            turn_id="maintenance-turn",
+            cwd=str(self.other),
+            prompt=(
+                "[codex-gardener:scheduled-maintenance] "
+                "[codex-gardener:scheduled-audit-check]"
+            ),
+        )
+        self.run_hook("SessionStart", maintenance)
+        self.run_hook("UserPromptSubmit", maintenance)
+
+        requested = self.run_hook("Stop", maintenance | {"stop_hook_active": False})
+
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn("audit-only", requested["reason"])
+        self.assertIn("Audit reason: review_threshold", requested["reason"])
+        self.assertNotIn("maintenance-only mode", requested["reason"])
+        self.assertEqual(gardener.effectiveness_report(14, self.other)["audits"]["requested"], 1)
+        self.assertEqual(gardener.pending_records()[0]["pending_id"], pending["pending_id"])
+
+    def test_combined_maintenance_and_not_due_audit_check_prioritizes_pending_work(self) -> None:
+        pending = self.queue_pending("source-session")
+        self.run_cli("audit-status", "--initialize")
         maintenance = self.payload(
             session_id="maintenance-session",
             turn_id="maintenance-turn",
@@ -1161,10 +1185,50 @@ class GardenerTest(unittest.TestCase):
         self.assertIn(pending["pending_id"], requested["reason"])
         self.assertNotIn("audit-only", requested["reason"])
         self.assertEqual(gardener.effectiveness_report(14, self.other)["audits"]["requested"], 0)
+
+    def test_combined_task_resumes_maintenance_on_run_after_audit_checkpoint(self) -> None:
+        pending = self.queue_pending("source-session")
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"checkpoint-priority-{index}")
+        first_run = self.payload(
+            session_id="audit-session",
+            turn_id="audit-turn",
+            cwd=str(self.other),
+            prompt=(
+                "[codex-gardener:scheduled-maintenance] "
+                "[codex-gardener:scheduled-audit-check]"
+            ),
+        )
+        self.run_hook("SessionStart", first_run)
+        self.run_hook("UserPromptSubmit", first_run)
+        requested = self.run_hook("Stop", first_run | {"stop_hook_active": False})
+        self.assertIn("audit-only", requested["reason"])
+
+        self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "audit-session",
+        )
         self.assertEqual(
-            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            self.run_hook("Stop", first_run | {"stop_hook_active": True}),
             {"continue": True},
         )
+        self.assertFalse(self.run_cli("audit-status")["due"])
+        self.assertEqual(gardener.pending_records()[0]["pending_id"], pending["pending_id"])
+        self.run_hook("SessionEnd", first_run)
+
+        next_run = first_run | {"session_id": "maintenance-session", "turn_id": "maintenance-turn"}
+        self.run_hook("SessionStart", next_run)
+        self.run_hook("UserPromptSubmit", next_run)
+        maintenance = self.run_hook("Stop", next_run | {"stop_hook_active": False})
+
+        self.assertEqual(maintenance["decision"], "block")
+        self.assertIn("maintenance-only mode", maintenance["reason"])
+        self.assertIn(pending["pending_id"], maintenance["reason"])
+        self.assertNotIn("audit-only", maintenance["reason"])
 
     def test_combined_maintenance_and_audit_check_audits_when_due_and_queue_empty(self) -> None:
         self.run_cli("audit-status", "--initialize")
