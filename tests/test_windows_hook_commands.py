@@ -41,6 +41,105 @@ class WindowsHookCommandTest(unittest.TestCase):
                 self.assertNotIn('"', command)
 
     @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_wrapper_decodes_raw_utf8_correction_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "scripts"
+            shutil.copytree(PLUGIN / "scripts", scripts)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            env = os.environ.copy()
+            env.pop("CODEX_GARDENER_DATA", None)
+            env.pop("PYTHONIOENCODING", None)
+            env.pop("PYTHONUTF8", None)
+            env.update(
+                {
+                    "PLUGIN_DATA": str(root / "plugin-data"),
+                    "CODEX_HOME": str(root / "codex-home"),
+                    "CODEX_GARDENER_EFFECTIVENESS_LOG": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
+            base = {
+                "session_id": "utf8-correction-session",
+                "turn_id": "utf8-correction-turn",
+                "cwd": str(workspace),
+            }
+
+            def invoke(event: str, payload: dict[str, object]) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.run(
+                    [
+                        os.environ.get("COMSPEC", "cmd.exe"),
+                        "/d",
+                        "/c",
+                        str(scripts / WRAPPER_NAME),
+                        "gardener",
+                        event,
+                    ],
+                    input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    capture_output=True,
+                    check=False,
+                    cwd=workspace,
+                    env=env,
+                )
+
+            session_start = invoke("SessionStart", {**base, "source": "startup"})
+            self.assertEqual(session_start.returncode, 0, session_start.stderr.decode("utf-8", errors="replace"))
+            prompt = invoke("UserPromptSubmit", {**base, "prompt": "纠正：请使用另一个入口"})
+            self.assertEqual(prompt.returncode, 0, prompt.stderr.decode("utf-8", errors="replace"))
+            stop = invoke("Stop", {**base, "stop_hook_active": False})
+            self.assertEqual(stop.returncode, 0, stop.stderr.decode("utf-8", errors="replace"))
+            self.assertEqual(json.loads(stop.stdout.decode("utf-8"))["decision"], "block")
+
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_wrapper_preserves_unicode_paths_for_project_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "scripts"
+            shutil.copytree(PLUGIN / "scripts", scripts)
+            primary = root / "主要项目"
+            other = root / "其他项目"
+            primary.mkdir()
+            other.mkdir()
+            subprocess.run(["git", "init", "-q", str(primary)], check=True)
+            subprocess.run(["git", "init", "-q", str(other)], check=True)
+            env = os.environ.copy()
+            env.pop("CODEX_GARDENER_DATA", None)
+            env.pop("PYTHONIOENCODING", None)
+            env.pop("PYTHONUTF8", None)
+            env.update(
+                {
+                    "PLUGIN_DATA": str(root / "plugin-data"),
+                    "CODEX_HOME": str(root / "codex-home"),
+                    "CODEX_GARDENER_EFFECTIVENESS_LOG": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
+            payload = {
+                "session_id": "utf8-boundary-session",
+                "cwd": str(primary),
+                "tool_name": "Write",
+                "tool_input": {"path": str(other / "规则.txt")},
+            }
+            result = subprocess.run(
+                [
+                    os.environ.get("COMSPEC", "cmd.exe"),
+                    "/d",
+                    "/c",
+                    str(scripts / WRAPPER_NAME),
+                    "project_boundary",
+                ],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                capture_output=True,
+                check=False,
+                cwd=primary,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+            output = json.loads(result.stdout.decode("utf-8"))
+            self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
     def test_outer_quoted_cmd_runner_executes_all_hooks_through_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -132,6 +231,39 @@ class WindowsHookCommandTest(unittest.TestCase):
             self.assertEqual(result.returncode, 23)
             self.assertEqual(result.stdout.strip(), "stdout:payload-sentinel")
             self.assertEqual(result.stderr.strip(), "stderr-sentinel")
+
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_wrapper_preserves_explicit_python_encoding_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(PLUGIN / "scripts" / WRAPPER_NAME, scripts / WRAPPER_NAME)
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            (fake_bin / "python.cmd").write_text(
+                "@echo off\n"
+                "echo %PYTHONUTF8%:%PYTHONIOENCODING%\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+                    "PYTHONUTF8": "0",
+                    "PYTHONIOENCODING": "gbk",
+                }
+            )
+            result = subprocess.run(
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", WRAPPER_NAME, "project_boundary"],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=scripts,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "0:gbk")
 
 
 if __name__ == "__main__":

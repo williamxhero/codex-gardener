@@ -590,7 +590,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.4.2")
+        self.assertEqual(report["health"]["plugin_version"], "0.4.3")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 
