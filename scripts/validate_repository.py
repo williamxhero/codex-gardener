@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.5.0", "Plugin version must be 0.5.0")
+    require(data.get("version") == "0.5.1", "Plugin version must be 0.5.1")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")

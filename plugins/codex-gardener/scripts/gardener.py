@@ -1397,7 +1397,8 @@ def handle_session_end(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
-    if signals and not state.get("capture_completed"):
+    audit_completed_without_capture_request = state.get("audit_completed") and not state.get("review_requested")
+    if signals and not state.get("capture_completed") and not audit_completed_without_capture_request:
         session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
         append_jsonl(
             pending_path(),

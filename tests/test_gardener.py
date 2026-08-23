@@ -294,6 +294,113 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(report["audits"]["completed"], 1)
         self.assertEqual(report["audits"]["reasons"], {"forced": 2})
 
+    def test_completed_smoke_audit_does_not_queue_its_own_tool_signals(self) -> None:
+        with patch.dict(os.environ, {gardener.effectiveness.RUN_KIND_ENV: "smoke"}):
+            self.run_hook("SessionStart", self.payload(source="startup"))
+            self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
+            requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
+            self.assertIn("$codex-gardener:knowledge-curator", requested["reason"])
+
+            for tool_use_id in ("audit-tool-1", "audit-tool-2"):
+                self.run_hook(
+                    "PostToolUse",
+                    self.payload(
+                        tool_name="Bash",
+                        tool_use_id=tool_use_id,
+                        tool_input={"command": "python gardener.py audit-status --json"},
+                        tool_response={"exit_code": 1},
+                    ),
+                )
+            self.run_cli(
+                "defer-audit-complete",
+                "--repo",
+                str(self.root),
+                "--session-id",
+                "session-1",
+            )
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+            self.run_hook("SessionEnd", self.payload(reason="other"))
+
+        status = self.run_cli("audit-status")
+        self.assertIsNone(status["checkpoint"]["last_successful_audit_at"])
+        self.assertIsNone(status["checkpoint"]["last_successful_audit_session"])
+        self.assertIsNone(status["checkpoint"]["last_successful_audit_completion"])
+        self.assertEqual(gardener.pending_records(), [])
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["audits"]["requested"], 1)
+        self.assertEqual(report["audits"]["completed"], 1)
+        self.assertEqual(report["reviews"]["pending_queued"], 0)
+
+    def test_completed_real_audit_persists_checkpoint_once_without_pending(self) -> None:
+        with patch.dict(os.environ, {gardener.effectiveness.RUN_KIND_ENV: "real"}):
+            self.run_hook("SessionStart", self.payload(source="startup"))
+            self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
+            requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
+            self.assertIn("$codex-gardener:knowledge-curator", requested["reason"])
+
+            for tool_use_id in ("audit-tool-1", "audit-tool-2"):
+                self.run_hook(
+                    "PostToolUse",
+                    self.payload(
+                        tool_name="Bash",
+                        tool_use_id=tool_use_id,
+                        tool_input={"command": "python gardener.py audit-status --json"},
+                        tool_response={"exit_code": 1},
+                    ),
+                )
+            self.run_cli(
+                "defer-audit-complete",
+                "--repo",
+                str(self.root),
+                "--session-id",
+                "session-1",
+            )
+            before = self.run_cli("audit-status")["checkpoint"]
+            self.assertIsNone(before["last_successful_audit_at"])
+
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+            checkpoint_text = gardener.audit_checkpoint_path().read_text(encoding="utf-8")
+            after = self.run_cli("audit-status")["checkpoint"]
+            self.assertIsNotNone(after["last_successful_audit_at"])
+            self.assertIsNotNone(after["last_successful_audit_session"])
+            self.assertIsNotNone(after["last_successful_audit_completion"])
+
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+            self.assertEqual(
+                gardener.audit_checkpoint_path().read_text(encoding="utf-8"),
+                checkpoint_text,
+            )
+            self.run_hook("SessionEnd", self.payload(reason="other"))
+
+        self.assertEqual(gardener.pending_records(), [])
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["audits"]["requested"], 1)
+        self.assertEqual(report["audits"]["completed"], 1)
+        self.assertEqual(report["reviews"]["pending_queued"], 0)
+
+    def test_completed_audit_does_not_hide_an_unfinished_capture(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.root),
+            "--session-id",
+            "session-1",
+        )
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="纠正：先完成 capture。[codex-gardener:scheduled-audit]"),
+        )
+        requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertIn("$codex-gardener:gardener-capture", requested["reason"])
+        self.run_hook("SessionEnd", self.payload(reason="other"))
+
+        pending = gardener.pending_records()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["session_id"], "session-1")
+        self.assertIn("user correction", pending[0]["signals"])
+
     def test_audit_request_is_one_shot_and_missing_marker_retries_next_session(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
         self.log_completed_review("threshold-review")
@@ -1029,7 +1136,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.5.0")
+        self.assertEqual(report["health"]["plugin_version"], "0.5.1")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 

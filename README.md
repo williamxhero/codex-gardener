@@ -76,6 +76,8 @@ Version `0.5.0` adds an automatic read-only knowledge-quality audit. It becomes 
 
 When due, Stop requests one `$codex-gardener:knowledge-curator` audit-only continuation. It inspects effectiveness, pending work, repository/global candidate status, conflicts, and staleness without promoting, resolving, or editing knowledge artifacts. The model writes only an ignored `defer-audit-complete` marker under `<repository>/.codex/learning/deferred-audits/`; the unsandboxed second Stop validates it, updates the checkpoint under `PLUGIN_DATA`, and records an `audit_completed` event. A missing or invalid marker never advances the checkpoint and is retried in a later task without looping the current turn.
 
+Version `0.5.1` prevents tools used inside a successfully completed audit continuation from being queued as an unfinished capture at SessionEnd. Smoke audits remain observable but intentionally do not reset the real audit checkpoint or count toward its review threshold.
+
 ## Local effectiveness audit
 
 Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin data root:
