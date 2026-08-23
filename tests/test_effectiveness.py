@@ -73,6 +73,38 @@ class EffectivenessTest(unittest.TestCase):
             )
         self.assertFalse(effectiveness.log_path(self.root).exists())
 
+    def test_review_and_audit_events_record_validated_run_kind_and_audit_metrics(self) -> None:
+        with patch.dict(os.environ, {effectiveness.RUN_KIND_ENV: "smoke"}):
+            effectiveness.log_event(
+                "review_requested",
+                root=self.root,
+                session="smoke-session",
+                project="smoke-project",
+                signals=["workspace_changed"],
+            )
+        with patch.dict(os.environ, {effectiveness.RUN_KIND_ENV: "invalid-value"}):
+            effectiveness.log_event(
+                "audit_requested",
+                root=self.root,
+                session="real-session",
+                project="real-project",
+                audit_reason="review_threshold",
+            )
+            effectiveness.log_event(
+                "audit_completed",
+                root=self.root,
+                session="real-session",
+                project="real-project",
+                audit_reason="review_threshold",
+            )
+
+        records = self.records()
+        self.assertEqual([record["run_kind"] for record in records], ["smoke", "real", "real"])
+        report = effectiveness.summarize(root=self.root)
+        self.assertEqual(report["audits"]["requested"], 1)
+        self.assertEqual(report["audits"]["completed"], 1)
+        self.assertEqual(report["audits"]["reasons"], {"review_threshold": 2})
+
     def test_logging_failure_fails_open(self) -> None:
         with patch.object(effectiveness, "file_lock", side_effect=OSError("simulated storage failure")):
             self.assertFalse(

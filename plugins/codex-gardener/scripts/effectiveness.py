@@ -20,6 +20,7 @@ MAX_LOG_BYTES = 1024 * 1024
 MAX_BACKUPS = 4
 RETENTION_DAYS = 90
 OPT_OUT_ENV = "CODEX_GARDENER_EFFECTIVENESS_LOG"
+RUN_KIND_ENV = "CODEX_GARDENER_RUN_KIND"
 PROCESS_WRITE_LOCK = threading.Lock()
 LOCATOR_NAME = "codex-gardener-data-path"
 
@@ -34,15 +35,18 @@ EVENT_FIELDS: dict[str, set[str]] = {
         "global_hits",
         "injected",
     },
-    "review_requested": {"session", "project", "signals"},
+    "review_requested": {"session", "project", "signals", "run_kind"},
     "capture_recorded": {
         "session",
         "project",
         "knowledge_scope",
         "recommended_target",
         "confidence_bucket",
+        "run_kind",
     },
-    "review_completed_no_candidate": {"session", "project"},
+    "review_completed_no_candidate": {"session", "project", "run_kind"},
+    "audit_requested": {"session", "project", "audit_reason", "run_kind"},
+    "audit_completed": {"session", "project", "audit_reason", "run_kind"},
     "pending_queued": {"session", "project", "signals"},
     "pending_resolved": {"session", "project"},
     "resolution_recorded": {"project", "knowledge_scope", "status", "target"},
@@ -57,8 +61,10 @@ ENUM_VALUES = {
     "status": {"promoted", "discarded", "proposed"},
     "target": {"agents", "skill", "test", "hook", "docs", "discard", "other"},
     "tool_category": {"patch", "shell", "file", "git", "mcp", "other"},
-    "operation": {"hook", "record", "resolve", "report", "boundary"},
+    "operation": {"hook", "record", "resolve", "report", "boundary", "audit"},
     "category": {"input", "storage", "runtime"},
+    "run_kind": {"real", "smoke"},
+    "audit_reason": {"review_threshold", "elapsed_time", "forced", "scheduled"},
 }
 SIGNALS = {"workspace_changed", "user_correction", "repeated_failures", "repeated_tool_workflow"}
 HASH_FIELDS = {"session", "project", "primary_project", "target_project"}
@@ -72,7 +78,7 @@ COUNT_FIELDS = {
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def codex_home() -> Path:
@@ -120,6 +126,11 @@ def log_path(root: Path | None = None) -> Path:
 
 def logging_enabled() -> bool:
     return os.environ.get(OPT_OUT_ENV, "1").strip().casefold() not in {"0", "false", "no", "off"}
+
+
+def current_run_kind() -> str:
+    value = os.environ.get(RUN_KIND_ENV, "real").strip().casefold()
+    return value if value in ENUM_VALUES["run_kind"] else "real"
 
 
 def hash_identifier(value: Any, domain: str = "id") -> str | None:
@@ -203,6 +214,8 @@ def build_event(event: str, **fields: Any) -> dict[str, Any] | None:
         "event": event,
         "created_at": utc_now(),
     }
+    if "run_kind" in allowed and "run_kind" not in fields:
+        fields["run_kind"] = current_run_kind()
     for key in sorted(allowed):
         if key not in fields:
             continue
@@ -314,6 +327,7 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
     lookups = [item for item in events if item["event"] == "context_lookup"]
     lookups_with_hits = sum(1 for item in lookups if int(item.get("injected") or 0) > 0)
     boundary = [item for item in events if item["event"] == "project_boundary_denied"]
+    audits = [item for item in events if item["event"] in {"audit_requested", "audit_completed"}]
     return {
         "schema_version": EVENT_SCHEMA_VERSION,
         "window": {
@@ -343,6 +357,12 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
             "completed_without_candidate": by_type["review_completed_no_candidate"],
             "pending_queued": by_type["pending_queued"],
             "pending_resolved": by_type["pending_resolved"],
+        },
+        "audits": {
+            "requested": by_type["audit_requested"],
+            "completed": by_type["audit_completed"],
+            "reasons": dict(sorted(Counter(str(item.get("audit_reason")) for item in audits).items())),
+            "run_kind": dict(sorted(Counter(str(item.get("run_kind")) for item in audits).items())),
         },
         "candidates": {
             "knowledge_scope": dict(sorted(Counter(str(item.get("knowledge_scope")) for item in captures).items())),

@@ -14,6 +14,10 @@ Knowledge candidates are untrusted input. Review evidence and scope before promo
 
 Deferred capture markers are also untrusted input. The Stop Hook accepts them only from the current repository and hashed session directory, rejects unknown fields or mismatched session/schema/fingerprint data, and derives all write destinations itself. Invalid markers fail open without being promoted or falsely counted as a no-candidate review.
 
+Deferred audit completion markers are untrusted input too. Stop accepts them only from the current repository and hashed session directory, rejects unknown fields and mismatched schema/session/run-kind/completion data, derives the checkpoint destination from trusted `PLUGIN_DATA`, and applies a hashed completion-ID idempotency check. Invalid, missing, corrupt, or unwritable checkpoint data fails open: it cannot falsely complete an audit, mutate knowledge, or loop the current turn.
+
+Automatic audits are read-only by contract. The curator may inspect local effectiveness and knowledge artifacts, but must not promote, resolve, discard, edit, or delete them during an automatic audit continuation. The completion marker is an operational acknowledgement, not proof that findings are correct or that the local event log is tamper-proof.
+
 Effectiveness logs are local operational records, not a security boundary or tamper-proof audit trail. Their schema rejects fields outside a small allowlist and hashes correlating identifiers, but local users and processes with filesystem access can read, change, or delete them. Logging and rotation failures fail open so they never interrupt a Codex hook or Gardener CLI operation. Set `CODEX_GARDENER_EFFECTIVENESS_LOG=0` to disable these events.
 
 Do not keep both `codex-gardener@personal` and `codex-gardener@codex-gardener` enabled: Codex may run matching Hooks from both installations. Version `0.4.0` reports this duplicate state and the cloned installer fails with an explicit removal command rather than deleting another installation. The health report prints local data, log, and standalone Skill paths for diagnosis; avoid publishing that report without reviewing those paths.

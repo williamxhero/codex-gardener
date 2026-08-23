@@ -1,4 +1,4 @@
 interface:
   display_name: "Knowledge Curator"
-  short_description: "Promote knowledge at the right scope"
-  default_prompt: "Use $codex-gardener:knowledge-curator to curate repository and global lessons at the narrowest valid scope."
+  short_description: "Audit or promote knowledge at the right scope"
+  default_prompt: "Use $codex-gardener:knowledge-curator to audit or curate repository and global lessons at the narrowest valid scope."

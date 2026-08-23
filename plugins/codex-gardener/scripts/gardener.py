@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -34,6 +34,14 @@ TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
 DEFERRED_CAPTURE_DIR = "deferred-captures"
+DEFERRED_AUDIT_DIR = "deferred-audits"
+AUDIT_CHECKPOINT_SCHEMA_VERSION = 1
+AUDIT_THRESHOLD_ENV = "CODEX_GARDENER_AUDIT_THRESHOLD"
+AUDIT_MAX_DAYS_ENV = "CODEX_GARDENER_AUDIT_MAX_DAYS"
+DEFAULT_AUDIT_THRESHOLD = 10
+DEFAULT_AUDIT_MAX_DAYS = 7
+SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
+AUDIT_REASONS = {"review_threshold", "elapsed_time", "forced", "scheduled"}
 CORRECTION_RE = re.compile(
     r"(?:不对|错了|纠正|我说的是|你忘了|没有按|不是.{0,20}而是|"
     r"\bwrong\b|\bincorrect\b|that's not|that is not|i said|you forgot|not what i asked)",
@@ -48,7 +56,7 @@ TEST_RE = re.compile(
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def json_dump(value: Any) -> str:
@@ -81,6 +89,144 @@ def plugin_data_root() -> Path:
     root = effectiveness.plugin_data_root()
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def positive_int_env(name: str, default: int, maximum: int = 1_000_000) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)).strip())
+    except (AttributeError, TypeError, ValueError):
+        return default
+    return value if 0 < value <= maximum else default
+
+
+def parse_utc(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def audit_checkpoint_path() -> Path:
+    return plugin_data_root() / "audit-checkpoint.json"
+
+
+def valid_audit_checkpoint(value: Any) -> bool:
+    allowed = {
+        "schema_version",
+        "initialized_at",
+        "last_successful_audit_at",
+        "last_successful_audit_session",
+        "last_successful_audit_completion",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != allowed
+        or value.get("schema_version") != AUDIT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        return False
+    if parse_utc(value.get("initialized_at")) is None:
+        return False
+    completed = value.get("last_successful_audit_at")
+    session_hash = value.get("last_successful_audit_session")
+    completion_hash = value.get("last_successful_audit_completion")
+    if completed is None:
+        return session_hash is None and completion_hash is None
+    return (
+        parse_utc(completed) is not None
+        and bool(re.fullmatch(r"[0-9a-f]{24}", str(session_hash or "")))
+        and bool(re.fullmatch(r"[0-9a-f]{24}", str(completion_hash or "")))
+    )
+
+
+def load_audit_checkpoint(*, initialize: bool, now: datetime) -> tuple[dict[str, Any] | None, str]:
+    path = audit_checkpoint_path()
+    existing = load_json_file(path, None)
+    if valid_audit_checkpoint(existing):
+        return existing, "existing"
+    checkpoint = {
+        "schema_version": AUDIT_CHECKPOINT_SCHEMA_VERSION,
+        "initialized_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "last_successful_audit_at": None,
+        "last_successful_audit_session": None,
+        "last_successful_audit_completion": None,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(path):
+            current = load_json_file(path, None)
+            if valid_audit_checkpoint(current):
+                return current, "existing"
+            if path.exists():
+                return None, "corrupt"
+            if not initialize:
+                return None, "missing"
+            atomic_write_json(path, checkpoint)
+    except (OSError, TimeoutError):
+        return None, "unavailable"
+    return checkpoint, "initialized"
+
+
+def audit_status(*, initialize: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    threshold = positive_int_env(AUDIT_THRESHOLD_ENV, DEFAULT_AUDIT_THRESHOLD)
+    max_days = positive_int_env(AUDIT_MAX_DAYS_ENV, DEFAULT_AUDIT_MAX_DAYS, 36_500)
+    checkpoint, checkpoint_status = load_audit_checkpoint(initialize=initialize, now=current)
+    result: dict[str, Any] = {
+        "schema_version": AUDIT_CHECKPOINT_SCHEMA_VERSION,
+        "available": checkpoint is not None,
+        "checkpoint_status": checkpoint_status,
+        "run_kind": effectiveness.current_run_kind(),
+        "review_threshold": threshold,
+        "max_days": max_days,
+        "qualifying_reviews": 0,
+        "deadline_at": None,
+        "due": False,
+        "reason": "checkpoint_unavailable" if checkpoint is None else "not_due",
+        "checkpoint": None,
+    }
+    if checkpoint is None:
+        return result
+    baseline_text = checkpoint.get("last_successful_audit_at") or checkpoint["initialized_at"]
+    baseline = parse_utc(baseline_text)
+    if baseline is None:
+        return result
+    requests: dict[str, datetime] = {}
+    terminals: dict[str, datetime] = {}
+    events, _ = effectiveness.read_events(root=plugin_data_root())
+    for event in events:
+        if event.get("run_kind") != "real":
+            continue
+        created = parse_utc(event.get("created_at"))
+        session = str(event.get("session") or "")
+        if created is None or created < baseline or not session:
+            continue
+        if event.get("event") == "review_requested":
+            prior = requests.get(session)
+            requests[session] = min(prior, created) if prior else created
+        elif event.get("event") in {"capture_recorded", "review_completed_no_candidate"}:
+            prior = terminals.get(session)
+            terminals[session] = max(prior, created) if prior else created
+    count = sum(
+        1
+        for session, requested_at in requests.items()
+        if session in terminals and terminals[session] >= requested_at
+    )
+    deadline = baseline + timedelta(days=max_days)
+    due = count >= threshold or current >= deadline
+    reason = "review_threshold" if count >= threshold else "elapsed_time" if current >= deadline else "not_due"
+    result.update(
+        {
+            "qualifying_reviews": count,
+            "deadline_at": deadline.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "due": due,
+            "reason": reason,
+            "checkpoint": checkpoint,
+        }
+    )
+    return result
 
 
 def safe_name(value: str) -> str:
@@ -235,6 +381,11 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "tool_counts": {},
         "review_requested": False,
         "capture_completed": False,
+        "audit_requested": False,
+        "audit_completed": False,
+        "audit_reason": None,
+        "continuation_kind": None,
+        "force_audit": False,
         "updated_at": utc_now(),
     }
 
@@ -526,6 +677,131 @@ def normalized_candidate_fields(args: argparse.Namespace) -> dict[str, Any]:
 
 def deferred_capture_dir(repo: Path, session_id: str) -> Path:
     return repo.resolve() / ".codex" / "learning" / DEFERRED_CAPTURE_DIR / safe_name(session_id)
+
+
+def deferred_audit_dir(repo: Path, session_id: str) -> Path:
+    return repo.resolve() / ".codex" / "learning" / DEFERRED_AUDIT_DIR / safe_name(session_id)
+
+
+def ensure_deferred_audit_dir(repo: Path, session_id: str) -> Path:
+    learning = repo.resolve() / ".codex" / "learning"
+    directory = deferred_audit_dir(repo, session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    ignore = learning / ".gitignore"
+    existing = ignore.read_text(encoding="utf-8").splitlines() if ignore.is_file() else []
+    ignored = f"{DEFERRED_AUDIT_DIR}/"
+    if ignored not in existing:
+        ignore.write_text("\n".join([*existing, ignored]).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return directory
+
+
+def defer_audit_completion(args: argparse.Namespace) -> dict[str, Any]:
+    repo = Path(args.repo).resolve()
+    session_id = str(args.session_id).strip()
+    if not session_id or len(session_id) > 256:
+        raise ValueError("session-id must contain 1 to 256 characters")
+    run_kind = effectiveness.current_run_kind()
+    marker = {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "deferred_audit_complete",
+        "session_id": session_id,
+        "run_kind": run_kind,
+        "completion_id": str(uuid.uuid4()),
+        "created_at": utc_now(),
+    }
+    path = ensure_deferred_audit_dir(repo, session_id) / "audit-complete.json"
+    atomic_write_json(path, marker)
+    return {"deferred": True, "run_kind": run_kind}
+
+
+def complete_audit_checkpoint(
+    repo: Path,
+    session_id: str,
+    audit_reason: str,
+    run_kind: str,
+    completion_id: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, bool]:
+    if audit_reason not in AUDIT_REASONS or run_kind not in {"real", "smoke"}:
+        return False, False
+    try:
+        uuid.UUID(completion_id)
+    except (AttributeError, TypeError, ValueError):
+        return False, False
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if run_kind == "real":
+        path = audit_checkpoint_path()
+        session_hash = effectiveness.hash_identifier(session_id, "session")
+        completion_hash = effectiveness.hash_identifier(completion_id, "audit-completion")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with file_lock(path):
+                checkpoint = load_json_file(path, None)
+                if checkpoint is None and not path.exists():
+                    checkpoint = {
+                        "schema_version": AUDIT_CHECKPOINT_SCHEMA_VERSION,
+                        "initialized_at": current.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                        "last_successful_audit_at": None,
+                        "last_successful_audit_session": None,
+                        "last_successful_audit_completion": None,
+                    }
+                if not valid_audit_checkpoint(checkpoint):
+                    return False, False
+                if checkpoint.get("last_successful_audit_completion") == completion_hash:
+                    return True, False
+                checkpoint["last_successful_audit_at"] = current.isoformat(timespec="microseconds").replace(
+                    "+00:00", "Z"
+                )
+                checkpoint["last_successful_audit_session"] = session_hash
+                checkpoint["last_successful_audit_completion"] = completion_hash
+                atomic_write_json(path, checkpoint)
+        except (OSError, TimeoutError):
+            return False, False
+    log_effectiveness(
+        "audit_completed",
+        session=session_identity(session_id),
+        project=project_identity(repo),
+        audit_reason=audit_reason,
+        run_kind=run_kind,
+    )
+    return True, True
+
+
+def consume_deferred_audits(repo: Path, session_id: str, audit_reason: str) -> tuple[int, int]:
+    processed = 0
+    invalid = 0
+    directory = deferred_audit_dir(repo, session_id)
+    for marker_path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        marker = load_json_file(marker_path, None)
+        allowed = {"schema_version", "record_type", "session_id", "run_kind", "completion_id", "created_at"}
+        if (
+            not isinstance(marker, dict)
+            or set(marker) - allowed
+            or marker.get("schema_version") != SCHEMA_VERSION
+            or marker.get("record_type") != "deferred_audit_complete"
+            or str(marker.get("session_id") or "") != session_id
+            or marker.get("run_kind") != effectiveness.current_run_kind()
+            or parse_utc(marker.get("created_at")) is None
+        ):
+            invalid += 1
+            continue
+        completed, _ = complete_audit_checkpoint(
+            repo,
+            session_id,
+            audit_reason if audit_reason in AUDIT_REASONS else "scheduled",
+            str(marker["run_kind"]),
+            str(marker.get("completion_id") or ""),
+        )
+        if not completed:
+            invalid += 1
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            marker_path.unlink()
+        processed += 1
+    with contextlib.suppress(OSError):
+        directory.rmdir()
+    return processed, invalid
 
 
 def ensure_deferred_capture_dir(repo: Path, session_id: str) -> Path:
@@ -927,6 +1203,7 @@ def complete_review_without_candidate(session_id: str) -> None:
 
 def handle_session_start(payload: dict[str, Any]) -> None:
     migrate_legacy_global_learning()
+    audit_status(initialize=True)
     path, state = load_state(payload)
     state = new_state(payload)
     save_state(path, state)
@@ -970,10 +1247,18 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "tool_counts": {},
                 "review_requested": False,
                 "capture_completed": False,
+                "audit_requested": False,
+                "audit_completed": False,
+                "audit_reason": None,
+                "continuation_kind": None,
+                "force_audit": SCHEDULED_AUDIT_MARKER in prompt,
             }
         )
-    elif CORRECTION_RE.search(prompt):
-        state["correction_signal"] = True
+    else:
+        if CORRECTION_RE.search(prompt):
+            state["correction_signal"] = True
+        if SCHEDULED_AUDIT_MARKER in prompt:
+            state["force_audit"] = True
     save_state(path, state)
     lookup_root = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
     context, metrics = promoted_context_result(lookup_root, prompt)
@@ -1015,9 +1300,24 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 
 def handle_stop(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
+    session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
+    repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
+    continuation_kind = str(state.get("continuation_kind") or "")
+    audit_processed, audit_invalid = consume_deferred_audits(
+        repo,
+        session_id,
+        str(state.get("audit_reason") or "scheduled"),
+    )
+    if audit_invalid:
+        log_effectiveness("operation_error", operation="audit", category="input")
+    if audit_processed:
+        state["audit_completed"] = True
+        state["continuation_kind"] = None
+        save_state(path, state)
     if payload.get("stop_hook_active"):
-        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
-        repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
+        if continuation_kind == "audit" or (state.get("audit_requested") and not state.get("review_requested")):
+            emit_json({"continue": True})
+            return
         processed, invalid = consume_deferred_candidates(repo, session_id)
         if invalid:
             log_effectiveness("operation_error", operation="record", category="input")
@@ -1037,26 +1337,58 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
-    if not signals or state.get("review_requested"):
+    if signals and not state.get("review_requested"):
+        state["review_requested"] = True
+        state["continuation_kind"] = "capture"
+        save_state(path, state)
+        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
+        repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
+        log_effectiveness(
+            "review_requested",
+            session=session_identity(session_id),
+            project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+            signals=safe_signal_categories(state),
+        )
+        reason = (
+            "Use $codex-gardener:gardener-capture now to review this completed task for reusable knowledge at the right scope. "
+            f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
+            "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
+            "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
+            "If nothing is reusable, report that outcome without running a completion command."
+        )
+        emit_json({"decision": "block", "reason": reason})
+        return
+    if audit_processed:
         save_state(path, state)
         emit_json({"continue": True})
         return
-    state["review_requested"] = True
+    status = audit_status(initialize=True)
+    should_audit = bool(state.get("force_audit")) or (
+        effectiveness.current_run_kind() == "real" and bool(status.get("due"))
+    )
+    if state.get("review_requested") or state.get("audit_requested") or not should_audit:
+        save_state(path, state)
+        emit_json({"continue": True})
+        return
+    audit_reason = "forced" if state.get("force_audit") else str(status.get("reason") or "elapsed_time")
+    state["audit_requested"] = True
+    state["audit_reason"] = audit_reason
+    state["continuation_kind"] = "audit"
     save_state(path, state)
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
     repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
     log_effectiveness(
-        "review_requested",
+        "audit_requested",
         session=session_identity(session_id),
         project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
-        signals=safe_signal_categories(state),
+        audit_reason=audit_reason,
     )
     reason = (
-        "Use $codex-gardener:gardener-capture now to review this completed task for reusable knowledge at the right scope. "
-        f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
-        "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
-        "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
-        "If nothing is reusable, report that outcome without running a completion command."
+        "Use $codex-gardener:knowledge-curator now in audit-only, read-only mode. "
+        f"Session ID: {session_id}. Repository: {repository}. Audit reason: {audit_reason}. "
+        "Inspect effectiveness, pending reviews, repository/global candidate scopes, conflicts, and staleness. "
+        "Do not promote, resolve, edit, or delete any knowledge artifact. When the audit is complete, write only the "
+        "sandbox-safe deferred audit completion marker described by the Skill."
     )
     emit_json({"decision": "block", "reason": reason})
 
@@ -1109,6 +1441,7 @@ def handle_hook(event: str) -> int:
 def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict[str, Any]:
     report = effectiveness.summarize(since_days=since_days)
     report["health"].update(plugin_health())
+    report["health"]["audit"] = audit_status(initialize=True)
     report["reviews"]["current_pending"] = len(pending_records(repo))
     if repo is not None:
         group_status: dict[str, dict[str, int]] = {}
@@ -1199,6 +1532,14 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
             f"{context['hits_global']} global entries injected"
         ),
         f"Boundary denials: {boundary['denials']}",
+        (
+            "Knowledge audit: "
+            f"due={report['health']['audit']['due']} "
+            f"reason={report['health']['audit']['reason']} "
+            f"reviews={report['health']['audit']['qualifying_reviews']}/"
+            f"{report['health']['audit']['review_threshold']} "
+            f"deadline={report['health']['audit']['deadline_at'] or 'unavailable'}"
+        ),
     ]
     if "candidate_group_status" in report:
         lines.append("Current candidate groups: " + json.dumps(report["candidate_group_status"], sort_keys=True))
@@ -1228,6 +1569,10 @@ def build_parser() -> argparse.ArgumentParser:
     deferred = sub.add_parser("defer-record")
     add_candidate_arguments(deferred)
 
+    deferred_audit = sub.add_parser("defer-audit-complete")
+    deferred_audit.add_argument("--repo", required=True)
+    deferred_audit.add_argument("--session-id", required=True)
+
     groups = sub.add_parser("groups")
     groups.add_argument("--repo", required=True)
     groups.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
@@ -1255,6 +1600,14 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--repo")
     report.add_argument("--json", action="store_true", dest="as_json")
 
+    audit = sub.add_parser("audit-status")
+    audit.add_argument("--repo")
+    audit.add_argument(
+        "--initialize",
+        action="store_true",
+        help="Explicitly request first-use checkpoint initialization (also the default for this command).",
+    )
+
     return parser
 
 
@@ -1268,6 +1621,8 @@ def main() -> int:
             emit_json(record_candidate(args))
         elif args.command == "defer-record":
             emit_json(defer_candidate(args))
+        elif args.command == "defer-audit-complete":
+            emit_json(defer_audit_completion(args))
         elif args.command == "groups":
             emit_json(
                 {
@@ -1293,6 +1648,8 @@ def main() -> int:
                 emit_json(report)
             else:
                 sys.stdout.write(format_effectiveness_report(report) + "\n")
+        elif args.command == "audit-status":
+            emit_json(audit_status(initialize=True))
         return 0
     except (OSError, ValueError, TimeoutError) as exc:
         sys.stderr.write(f"codex-gardener: {exc}\n")

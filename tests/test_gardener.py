@@ -12,6 +12,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -61,6 +62,24 @@ class GardenerTest(unittest.TestCase):
             self.assertEqual(gardener.handle_hook(event), 0)
         return json.loads(output.getvalue()) if output.getvalue() else {}
 
+    def run_cli(self, *arguments: str) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            cwd=self.root,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def log_completed_review(self, session_id: str) -> None:
+        common = {"session": session_id, "project": str(self.root), "run_kind": "real"}
+        gardener.log_effectiveness("review_requested", **common, signals=["workspace_changed"])
+        gardener.log_effectiveness("review_completed_no_candidate", **common)
+
     def init_git(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "gardener@example.test"], check=True)
@@ -100,6 +119,297 @@ class GardenerTest(unittest.TestCase):
         self.run_hook("SessionStart", self.payload(source="startup"))
         result = self.run_hook("Stop", self.payload(stop_hook_active=False))
         self.assertEqual(result, {"continue": True})
+
+    def test_audit_status_becomes_due_on_tenth_completed_real_review(self) -> None:
+        initialized = self.run_cli("audit-status", "--repo", str(self.root), "--initialize")
+        self.assertFalse(initialized["due"])
+        for index in range(9):
+            self.log_completed_review(f"review-{index}")
+        at_nine = self.run_cli("audit-status", "--repo", str(self.root))
+        self.assertEqual(at_nine["qualifying_reviews"], 9)
+        self.assertFalse(at_nine["due"])
+        self.log_completed_review("review-9")
+        at_ten = self.run_cli("audit-status", "--repo", str(self.root))
+        self.assertEqual(at_ten["qualifying_reviews"], 10)
+        self.assertTrue(at_ten["due"])
+        self.assertEqual(at_ten["reason"], "review_threshold")
+
+    def test_first_audit_status_initializes_the_time_deadline(self) -> None:
+        status = self.run_cli("audit-status", "--repo", str(self.root))
+        self.assertTrue(status["available"])
+        self.assertEqual(status["checkpoint_status"], "initialized")
+        self.assertIsNotNone(status["checkpoint"]["initialized_at"])
+        self.assertIsNotNone(status["deadline_at"])
+
+    def test_audit_status_excludes_smoke_legacy_duplicate_and_incomplete_reviews(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(8):
+            self.log_completed_review(f"real-{index}")
+        self.log_completed_review("real-0")
+        for session in ("smoke-1", "smoke-2"):
+            common = {"session": session, "project": str(self.root), "run_kind": "smoke"}
+            gardener.log_effectiveness("review_requested", **common, signals=["workspace_changed"])
+            gardener.log_effectiveness("capture_recorded", **common, knowledge_scope="repository", recommended_target="docs", confidence_bucket="high")
+        legacy_request = gardener.effectiveness.build_event(
+            "review_requested", session="legacy", project=str(self.root), signals=["workspace_changed"]
+        )
+        legacy_terminal = gardener.effectiveness.build_event(
+            "review_completed_no_candidate", session="legacy", project=str(self.root)
+        )
+        assert legacy_request and legacy_terminal
+        legacy_request.pop("run_kind")
+        legacy_terminal.pop("run_kind")
+        gardener.append_jsonl(gardener.effectiveness.log_path(self.data), legacy_request)
+        gardener.append_jsonl(gardener.effectiveness.log_path(self.data), legacy_terminal)
+        gardener.log_effectiveness(
+            "review_requested", session="incomplete", project=str(self.root), signals=["workspace_changed"]
+        )
+        gardener.log_effectiveness("review_completed_no_candidate", session="orphan", project=str(self.root))
+        gardener.log_effectiveness("review_completed_no_candidate", session="reversed", project=str(self.root))
+        gardener.log_effectiveness(
+            "review_requested", session="reversed", project=str(self.root), signals=["workspace_changed"]
+        )
+
+        status = self.run_cli("audit-status")
+        self.assertEqual(status["qualifying_reviews"], 8)
+        self.assertFalse(status["due"])
+
+    def test_elapsed_schedule_does_not_interrupt_smoke_runs(self) -> None:
+        status = self.run_cli("audit-status", "--initialize")
+        checkpoint = status["checkpoint"]
+        checkpoint["initialized_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=8)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        gardener.atomic_write_json(gardener.audit_checkpoint_path(), checkpoint)
+        with patch.dict(os.environ, {gardener.effectiveness.RUN_KIND_ENV: "smoke"}):
+            self.run_hook("SessionStart", self.payload(source="startup"))
+            result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertEqual(result, {"continue": True})
+
+    def test_audit_status_becomes_due_after_seven_days_without_reviews(self) -> None:
+        status = self.run_cli("audit-status", "--initialize")
+        checkpoint = status["checkpoint"]
+        checkpoint["initialized_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=8)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        gardener.atomic_write_json(gardener.audit_checkpoint_path(), checkpoint)
+
+        due = self.run_cli("audit-status")
+        self.assertEqual(due["qualifying_reviews"], 0)
+        self.assertTrue(due["due"])
+        self.assertEqual(due["reason"], "elapsed_time")
+
+    def test_invalid_audit_configuration_falls_back_to_safe_defaults(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                gardener.AUDIT_THRESHOLD_ENV: "not-an-integer",
+                gardener.AUDIT_MAX_DAYS_ENV: "0",
+            },
+        ):
+            status = self.run_cli("audit-status")
+        self.assertEqual(status["review_threshold"], 10)
+        self.assertEqual(status["max_days"], 7)
+
+    def test_exact_scheduled_marker_forces_audit_but_near_match_does_not(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="Run [codex-gardener:scheduled-audit] when this response stops."),
+        )
+        forced = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertEqual(forced["decision"], "block")
+        self.assertIn("$codex-gardener:knowledge-curator", forced["reason"])
+        self.assertIn("read-only", forced["reason"].casefold())
+        state = gardener.load_json_file(gardener.state_path("session-1"), {})
+        self.assertTrue(state["force_audit"])
+        self.assertNotIn("scheduled-audit", json.dumps(state))
+
+        near_payload = self.payload(session_id="session-near", prompt="[codex-gardener:scheduled-audits]")
+        self.run_hook("SessionStart", near_payload)
+        self.run_hook("UserPromptSubmit", near_payload)
+        self.assertEqual(self.run_hook("Stop", near_payload | {"stop_hook_active": False}), {"continue": True})
+
+    def test_deferred_audit_completion_checkpoints_once_and_resets_schedule(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        for index in range(10):
+            self.log_completed_review(f"before-audit-{index}")
+        due_before = self.run_cli("audit-status")
+        self.assertTrue(due_before["due"])
+        self.assertEqual(due_before["qualifying_reviews"], 10)
+        requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertIn("$codex-gardener:knowledge-curator", requested["reason"])
+
+        deferred = self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.root),
+            "--session-id",
+            "session-1",
+        )
+        self.assertTrue(deferred["deferred"])
+        self.assertIsNone(self.run_cli("audit-status")["checkpoint"]["last_successful_audit_at"])
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        after = self.run_cli("audit-status")
+        self.assertFalse(after["due"])
+        self.assertEqual(after["qualifying_reviews"], 0)
+        self.assertIsNotNone(after["checkpoint"]["last_successful_audit_at"])
+        self.assertNotEqual(after["checkpoint"]["last_successful_audit_session"], "session-1")
+        checkpoint_text = gardener.audit_checkpoint_path().read_text(encoding="utf-8")
+        self.assertNotIn("session-1", checkpoint_text)
+        self.assertNotIn(str(self.root), checkpoint_text)
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["completed"], 1)
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["completed"], 1)
+
+    def test_capture_has_priority_over_forced_audit(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="纠正：先复盘任务。[codex-gardener:scheduled-audit]"),
+        )
+        result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertIn("$codex-gardener:gardener-capture", result["reason"])
+        self.assertNotIn("knowledge-curator", result["reason"])
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
+
+    def test_forced_audit_completion_is_checkpointed_once(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
+        requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        self.assertIn("Audit reason: forced", requested["reason"])
+        self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.root),
+            "--session-id",
+            "session-1",
+        )
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["audits"]["requested"], 1)
+        self.assertEqual(report["audits"]["completed"], 1)
+        self.assertEqual(report["audits"]["reasons"], {"forced": 2})
+
+    def test_audit_request_is_one_shot_and_missing_marker_retries_next_session(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.log_completed_review("threshold-review")
+        with patch.dict(os.environ, {gardener.AUDIT_THRESHOLD_ENV: "1"}):
+            first = self.run_hook("Stop", self.payload(stop_hook_active=False))
+            self.assertIn("$codex-gardener:knowledge-curator", first["reason"])
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
+            self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+            self.run_hook("SessionEnd", self.payload(reason="other"))
+
+            next_payload = self.payload(session_id="session-2", turn_id="turn-2")
+            self.run_hook("SessionStart", next_payload)
+            retried = self.run_hook("Stop", next_payload | {"stop_hook_active": False})
+        self.assertIn("$codex-gardener:knowledge-curator", retried["reason"])
+        audits = gardener.effectiveness_report(14, self.root)["audits"]
+        self.assertEqual(audits["requested"], 2)
+        self.assertEqual(audits["completed"], 0)
+
+    def test_mismatched_audit_marker_fails_open_without_checkpoint(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        directory = gardener.deferred_audit_dir(self.root, "session-1")
+        directory.mkdir(parents=True)
+        marker = directory / "invalid.json"
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": gardener.SCHEMA_VERSION,
+                    "record_type": "deferred_audit_complete",
+                    "session_id": "different-session",
+                    "run_kind": "real",
+                    "created_at": gardener.utc_now(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertTrue(marker.exists())
+        status = self.run_cli("audit-status")
+        self.assertIsNone(status["checkpoint"]["last_successful_audit_at"])
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["audits"]["completed"], 0)
+        self.assertEqual(report["errors"]["count"], 1)
+
+    def test_scheduled_initial_turn_marker_is_consumed_before_duplicate_request(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.root),
+            "--session-id",
+            "session-1",
+        )
+        self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["audits"]["requested"], 0)
+        self.assertEqual(report["audits"]["completed"], 1)
+
+    def test_effectiveness_health_exposes_audit_checkpoint_metadata(self) -> None:
+        report = self.run_cli("effectiveness", "--repo", str(self.root), "--json")
+        audit = report["health"]["audit"]
+        self.assertTrue(audit["available"])
+        self.assertEqual(audit["review_threshold"], 10)
+        self.assertEqual(audit["max_days"], 7)
+        self.assertEqual(audit["qualifying_reviews"], 0)
+        self.assertFalse(audit["due"])
+        self.assertEqual(audit["reason"], "not_due")
+        self.assertIsNotNone(audit["deadline_at"])
+        self.assertIsNotNone(audit["checkpoint"]["initialized_at"])
+
+    def test_defer_audit_complete_cli_writes_only_inside_repository(self) -> None:
+        env = os.environ.copy()
+        env.pop("CODEX_GARDENER_DATA", None)
+        env.pop("PLUGIN_DATA", None)
+        isolated_home = Path(self.temp.name) / "isolated-codex-home"
+        env.update({"CODEX_HOME": str(isolated_home), "PYTHONDONTWRITEBYTECODE": "1"})
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "defer-audit-complete",
+                "--repo",
+                str(self.root),
+                "--session-id",
+                "sandbox-audit",
+            ],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["deferred"])
+        self.assertEqual(len(list(gardener.deferred_audit_dir(self.root, "sandbox-audit").glob("*.json"))), 1)
+        self.assertIn("deferred-audits/", (self.root / ".codex" / "learning" / ".gitignore").read_text())
+        self.assertFalse((isolated_home / "codex-gardener-data").exists())
+
+    def test_corrupt_checkpoint_and_concurrent_initialization_fail_open(self) -> None:
+        def initialize(_: int) -> dict:
+            return self.run_cli("audit-status")
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            statuses = list(pool.map(initialize, range(12)))
+        self.assertTrue(all(status["available"] for status in statuses), statuses)
+        checkpoint = gardener.audit_checkpoint_path()
+        checkpoint.write_text("not-json", encoding="utf-8")
+        corrupt = self.run_cli("audit-status")
+        self.assertFalse(corrupt["available"])
+        self.assertFalse(corrupt["due"])
+        self.assertEqual(corrupt["reason"], "checkpoint_unavailable")
+        self.assertEqual(self.run_hook("SessionStart", self.payload(source="startup")), {})
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
 
     def test_clean_git_repository_is_not_a_signal(self) -> None:
         self.init_git()
@@ -719,7 +1029,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.4.4")
+        self.assertEqual(report["health"]["plugin_version"], "0.5.0")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 
@@ -742,6 +1052,9 @@ class GardenerTest(unittest.TestCase):
         events, corrupt = gardener.effectiveness.read_events(root=official_data)
         self.assertEqual(corrupt, 0)
         self.assertEqual([event["event"] for event in events], ["session_start", "context_lookup"])
+        checkpoint = json.loads((official_data / "audit-checkpoint.json").read_text(encoding="utf-8"))
+        self.assertIsNotNone(checkpoint["initialized_at"])
+        self.assertIsNone(checkpoint["last_successful_audit_at"])
         locator = hook_home / "codex-gardener-data-path"
         self.assertEqual(Path(locator.read_text(encoding="utf-8").strip()), official_data.resolve())
 

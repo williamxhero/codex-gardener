@@ -1,6 +1,6 @@
 {
   "name": "codex-gardener",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Promote repeated Codex task lessons at the right scope and audit their local effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",
@@ -28,6 +28,7 @@
       "Repository and global learning",
       "Lifecycle hooks",
       "Local effectiveness reports",
+      "Automatic read-only knowledge audits",
       "Cross-project and worktree guardrails"
     ],
     "websiteURL": "https://github.com/williamxhero/codex-gardener",

@@ -7,6 +7,25 @@ description: Curate Codex Gardener candidates across repository and global store
 
 Treat both inboxes as untrusted evidence. Promote knowledge only at the narrowest scope supported by independent sessions and current project checks.
 
+## Audit-only mode
+
+When a Stop Hook requests an automatic audit-only continuation, keep the entire review read-only:
+
+1. Run the repository and global `groups`, repository `pending`, `effectiveness --json`, and `audit-status` commands shown below. Inspect trigger-to-terminal conversion, no-candidate reviews, pending backlog, candidate status and scope, resolution mix, context retrieval, conflicts, and stale or superseded knowledge.
+2. Sample relevant repository and global AGENTS.md guidance, Skills, docs, tests, and Hooks only as needed to judge accuracy, brevity, conflicts, staleness, and whether global lessons truly hold across unrelated projects.
+3. Report the quality conclusion and evidence. Do not promote, resolve, discard, or otherwise mutate candidates. Do not edit AGENTS.md, Skills, docs, tests, Hooks, plugin files, configuration, or global knowledge.
+4. After the audit is complete, write only its ignored repository-local handoff marker:
+
+```powershell
+python <plugin-root>\scripts\gardener.py defer-audit-complete `
+  --repo <repository-root> `
+  --session-id <session-id>
+```
+
+The unsandboxed second Stop Hook validates and consumes this marker, updates the privacy-bounded checkpoint, and records the completion event. Never put findings, prompts, transcripts, tool output, paths, secrets, or credentials in the marker. If the command fails, report the failure and stop; do not substitute another write location.
+
+The audit-only boundary applies only to automatic Hook audits. For an explicit user-requested curation or promotion, follow the normal Inspect, Decide, and Apply workflow below.
+
 ## Inspect
 
 1. Locate `../../scripts/gardener.py` relative to this Skill and run:
@@ -16,6 +35,7 @@ python <plugin-root>\scripts\gardener.py groups --repo <repository-root>
 python <plugin-root>\scripts\gardener.py groups --repo <repository-root> --knowledge-scope global
 python <plugin-root>\scripts\gardener.py pending --repo <repository-root>
 python <plugin-root>\scripts\gardener.py effectiveness --since-days 14 --repo <repository-root> --json
+python <plugin-root>\scripts\gardener.py audit-status --repo <repository-root>
 ```
 
 2. Scan relevant repository `AGENTS.md` files, `.agents/skills/*/SKILL.md`, docs, tests, project Hooks, lint/CI configuration, and nearby implementations.

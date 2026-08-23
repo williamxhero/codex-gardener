@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.4.4", "Plugin version must be 0.4.4")
+    require(data.get("version") == "0.5.0", "Plugin version must be 0.5.0")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -158,6 +158,14 @@ def validate_hygiene() -> None:
     require("knowledge_scope" in gardener_source, "Knowledge scope schema is missing")
     require('sub.add_parser("effectiveness")' in gardener_source, "Effectiveness CLI is missing")
     require('sub.add_parser("defer-record")' in gardener_source, "Sandbox-safe deferred capture CLI is missing")
+    require('sub.add_parser("audit-status")' in gardener_source, "Knowledge audit status CLI is missing")
+    require(
+        'sub.add_parser("defer-audit-complete")' in gardener_source,
+        "Sandbox-safe deferred audit completion CLI is missing",
+    )
+    require("CODEX_GARDENER_AUDIT_THRESHOLD" in gardener_source, "Knowledge audit review threshold is missing")
+    require("CODEX_GARDENER_AUDIT_MAX_DAYS" in gardener_source, "Knowledge audit time threshold is missing")
+    require("CODEX_GARDENER_RUN_KIND" in effectiveness_source, "Effectiveness run-kind classification is missing")
     require("observation_status" in effectiveness_source, "Effectiveness health status is missing")
     require("legacy-user-learning-v1" in gardener_source, "Legacy user learning migration is missing")
     require("duplicate_enabled_plugin_ids" in gardener_source, "Duplicate plugin detection is missing")

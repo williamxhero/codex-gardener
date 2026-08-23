@@ -46,7 +46,7 @@ Use `python3` when `python` is unavailable. The installer locates `codex`, valid
 | --- | --- |
 | `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
 | `$codex-gardener:gardener-capture` | Classify each lesson and defer concise evidence for the unsandboxed Stop Hook without editing promoted artifacts. |
-| `$codex-gardener:knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
+| `$codex-gardener:knowledge-curator` | Run read-only quality audits or aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
 | `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
 | `$codex-gardener:cross-project-delegation` | Move authorized implementation into its owning repository and isolate concurrent writers in unique Git worktrees. |
@@ -72,6 +72,10 @@ Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` de
 
 Version `0.4.4` makes capture safe under normal `workspace-write` execution. The continued model writes validated `defer-record` markers only under ignored `<repository>/.codex/learning/deferred-captures/`; it never needs model-shell access to plugin data or the global store. The second Stop Hook validates session, schema, allowed fields, scope, target, confidence, and fingerprint, then writes formal repository or global candidates and effectiveness events outside the model sandbox. Repeated Stop delivery is idempotent by fingerprint and session. A no-candidate review runs no model command and is recorded directly by the second Stop Hook. The original `record` and `review-complete` CLI commands remain available for backward-compatible direct use outside restricted model execution.
 
+Version `0.5.0` adds an automatic read-only knowledge-quality audit. It becomes due after either 10 unique completed real reviews or 7 elapsed days since the checkpoint was initialized or last successfully audited, whichever happens first. A qualifying review must contain a `review_requested` event and a terminal `capture_recorded` or `review_completed_no_candidate` event for the same session. Duplicate sessions, incomplete reviews, smoke runs, and pre-0.5 unlabelled events do not count. Capture continuations always take priority over audits.
+
+When due, Stop requests one `$codex-gardener:knowledge-curator` audit-only continuation. It inspects effectiveness, pending work, repository/global candidate status, conflicts, and staleness without promoting, resolving, or editing knowledge artifacts. The model writes only an ignored `defer-audit-complete` marker under `<repository>/.codex/learning/deferred-audits/`; the unsandboxed second Stop validates it, updates the checkpoint under `PLUGIN_DATA`, and records an `audit_completed` event. A missing or invalid marker never advances the checkpoint and is retried in a later task without looping the current turn.
+
 ## Local effectiveness audit
 
 Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin data root:
@@ -80,7 +84,7 @@ Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin 
 <plugin-data>/effectiveness/events.jsonl
 ```
 
-It records only allow-listed derived events: session and project hashes, promoted-context lookup and hit counts split by repository/global scope, safe retrospective signal categories, capture scope/target/confidence bucket, no-candidate completion, pending queue changes, resolution distributions, and cross-project denial categories. It does not record prompts, tool input/output, transcripts, file contents, secrets, raw paths, or raw session/turn IDs. Ordinary tool calls are not logged.
+It records only allow-listed derived events: session and project hashes, promoted-context lookup and hit counts split by repository/global scope, safe retrospective signal categories, capture scope/target/confidence bucket, no-candidate completion, audit requests/completions and fixed reasons, pending queue changes, resolution distributions, and cross-project denial categories. Relevant review and audit events include a validated `real` or `smoke` run kind. It does not record prompts, tool input/output, transcripts, file contents, secrets, raw paths, or raw session/turn IDs. Ordinary tool calls are not logged.
 
 The active log rotates at 1 MiB, keeps at most four bounded backups, and discards rotated files older than 90 days. Logging uses only the Python standard library, is concurrency-safe, and always fails open. Disable it before starting Codex with:
 
@@ -94,9 +98,23 @@ On PowerShell use `$env:CODEX_GARDENER_EFFECTIVENESS_LOG = "0"`. Generate a huma
 python <plugin-root>/scripts/gardener.py effectiveness
 python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --json
 python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /path/to/repo --json
+python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo
+python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo --initialize
 ```
 
-Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, standalone cross-project Skill detection, data-root source, resolved local data/log paths, log existence, latest event time, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
+`audit-status` initializes a missing v0.5 checkpoint so its time deadline begins; `--initialize` is accepted for callers that want to make that first-use intent explicit. Without `--repo`, the effectiveness report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, standalone cross-project Skill detection, data-root source, resolved local data/log paths, log existence, latest event time, audit checkpoint metadata, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. It also reports `audit_requested` and `audit_completed` totals and distributions. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
+
+The schedule defaults can be overridden before Codex starts:
+
+```bash
+CODEX_GARDENER_AUDIT_THRESHOLD=10
+CODEX_GARDENER_AUDIT_MAX_DAYS=7
+CODEX_GARDENER_RUN_KIND=real
+```
+
+Thresholds must be positive integers; invalid values safely fall back to 10 reviews and 7 days. `CODEX_GARDENER_RUN_KIND` accepts only `real` or `smoke` and otherwise falls back to `real`. Use `smoke` for manual Hook or end-to-end tests so they never advance the real-review counter or real audit checkpoint.
+
+For a fixed weekly automation, include the exact marker `[codex-gardener:scheduled-audit]` in its prompt and tell the first response not to audit directly. The normal Stop Hook then requests the same audit-only curator continuation even when the rolling count/time checkpoint is not due. Near matches do not trigger it. If an initial response already completed the audit and left a valid marker, Stop consumes that marker before considering another audit request.
 
 ## Learning and promotion model
 
