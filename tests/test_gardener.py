@@ -782,6 +782,31 @@ class GardenerTest(unittest.TestCase):
             self.assertEqual(groups[0]["evidence_status"], "candidate")
             self.assertEqual(groups[0]["resolution"]["status"], status)
 
+    def test_groups_ignores_later_resolution_with_invalid_status(self) -> None:
+        candidate = gardener.record_candidate(self.candidate_args())
+        valid = gardener.resolve_candidate(
+            self.resolution_args(
+                fingerprint=candidate["fingerprint"],
+                status="promoted",
+            )
+        )
+        gardener.append_jsonl(
+            gardener.ensure_learning_dir(self.root) / "resolutions.jsonl",
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "fingerprint": candidate["fingerprint"],
+                "knowledge_scope": "repository",
+                "status": "invalid-status",
+                "created_at": gardener.utc_now(),
+            },
+        )
+
+        group = gardener.aggregate_candidates(self.root)[0]
+
+        self.assertEqual(group["status"], "promoted")
+        self.assertEqual(group["evidence_status"], "candidate")
+        self.assertEqual(group["resolution"], valid)
+
     def test_legacy_candidate_defaults_to_repository_scope(self) -> None:
         legacy = {
             "schema_version": 1,

@@ -1046,7 +1046,11 @@ def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> lis
         for resolution in read_learning_records(repo, knowledge_scope, "resolutions.jsonl")
         if stored_knowledge_scope(resolution.get("knowledge_scope")) == knowledge_scope
     ]
-    latest_resolution = {str(item.get("fingerprint")): item for item in resolutions if item.get("fingerprint")}
+    latest_resolution = {
+        str(item.get("fingerprint")): item
+        for item in resolutions
+        if item.get("fingerprint") and str(item.get("status") or "") in SAFE_RESOLUTION_STATUSES
+    }
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         fingerprint = record.get("fingerprint")
