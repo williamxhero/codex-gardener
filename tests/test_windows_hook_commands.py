@@ -12,14 +12,15 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 PLUGIN = ROOT / "plugins" / "codex-gardener"
 HOOKS = PLUGIN / "hooks" / "hooks.json"
+WRAPPER_NAME = "codex-gardener-hook.cmd"
 
 EXPECTED_WINDOWS_COMMANDS = {
-    "PreToolUse": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m project_boundary",
-    "SessionStart": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook SessionStart",
-    "UserPromptSubmit": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook UserPromptSubmit",
-    "PostToolUse": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook PostToolUse",
-    "Stop": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook Stop",
-    "SessionEnd": "set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m gardener hook SessionEnd",
+    "PreToolUse": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} project_boundary",
+    "SessionStart": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} gardener SessionStart",
+    "UserPromptSubmit": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} gardener UserPromptSubmit",
+    "PostToolUse": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} gardener PostToolUse",
+    "Stop": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} gardener Stop",
+    "SessionEnd": f"cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\{WRAPPER_NAME} gardener SessionEnd",
 }
 
 
@@ -32,7 +33,7 @@ def windows_commands() -> dict[str, str]:
 
 
 class WindowsHookCommandTest(unittest.TestCase):
-    def test_all_windows_commands_are_quote_free_module_invocations(self) -> None:
+    def test_all_windows_commands_are_quote_free_wrapper_invocations(self) -> None:
         commands = windows_commands()
         self.assertEqual(commands, EXPECTED_WINDOWS_COMMANDS)
         for event, command in commands.items():
@@ -40,10 +41,11 @@ class WindowsHookCommandTest(unittest.TestCase):
                 self.assertNotIn('"', command)
 
     @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
-    def test_outer_quoted_cmd_runner_executes_all_hooks_with_spaced_plugin_root(self) -> None:
+    def test_outer_quoted_cmd_runner_executes_all_hooks_through_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            plugin_root = root / "Plugin Root With Spaces"
+            plugin_root = root / "plugin-root"
+            self.assertNotIn(" ", str(plugin_root))
             shutil.copytree(PLUGIN / "scripts", plugin_root / "scripts")
             workspace = root / "workspace"
             workspace.mkdir()
@@ -98,6 +100,38 @@ class WindowsHookCommandTest(unittest.TestCase):
                         self.assertEqual(json.loads(result.stdout), {"continue": True})
                     else:
                         self.assertEqual(result.stdout, "")
+
+    @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
+    def test_wrapper_forwards_standard_streams_and_exit_code_from_spaced_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "Wrapper Root With Spaces" / "scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(PLUGIN / "scripts" / WRAPPER_NAME, scripts / WRAPPER_NAME)
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            (fake_bin / "python.cmd").write_text(
+                "@echo off\n"
+                "set /p INPUT=\n"
+                "echo stdout:%INPUT%\n"
+                "echo stderr-sentinel 1>&2\n"
+                "exit /b 23\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+            result = subprocess.run(
+                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", WRAPPER_NAME, "project_boundary"],
+                input="payload-sentinel\n",
+                text=True,
+                capture_output=True,
+                check=False,
+                cwd=scripts,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 23)
+            self.assertEqual(result.stdout.strip(), "stdout:payload-sentinel")
+            self.assertEqual(result.stderr.strip(), "stderr-sentinel")
 
 
 if __name__ == "__main__":

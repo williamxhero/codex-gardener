@@ -27,7 +27,7 @@ codex plugin add codex-gardener@codex-gardener
 
 Start a new Codex task after installation. Run `/hooks`, inspect every command in `hooks/hooks.json`, and explicitly trust the hooks only if you are comfortable with their local behavior. Hooks remain opt-in.
 
-Version `0.4.1` uses quote-free Windows module launchers so Codex's outer `cmd.exe /C` quoting works even when the installed plugin path contains spaces.
+Version `0.4.2` uses a quote-free outer Windows command that invokes `scripts/codex-gardener-hook.cmd`; quoted Python setup stays inside the wrapper so Codex CLI `0.147.0` can launch Hooks reliably. The outer command cannot quote `%PLUGIN_ROOT%`, so Windows plugin roots containing spaces remain unsupported by this workaround. Codex's normal marketplace cache path does not contain spaces.
 
 ## Install from a clone
 

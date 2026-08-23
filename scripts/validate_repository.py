@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.4.1", "Plugin version must be 0.4.1")
+    require(data.get("version") == "0.4.2", "Plugin version must be 0.4.2")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -95,13 +95,14 @@ def validate_hooks() -> None:
         command = entries[0]["hooks"][0].get("commandWindows", "")
         require('"' not in command, f"Windows Hook command must not contain embedded quotes: {event}")
         require(
-            command.startswith("set PYTHONPATH=%PLUGIN_ROOT%\\scripts&& python -m "),
-            f"Windows Hook command must use the quote-free module launcher: {event}",
+            command.startswith("cmd.exe /d /c %PLUGIN_ROOT%\\scripts\\codex-gardener-hook.cmd "),
+            f"Windows Hook command must use the quote-free wrapper launcher: {event}",
         )
     rendered = path.read_text(encoding="utf-8")
     for script in ("gardener.py", "project_boundary.py"):
         require(script in rendered and (PLUGIN / "scripts" / script).is_file(), f"Hook script is missing: {script}")
     require((PLUGIN / "scripts" / "effectiveness.py").is_file(), "Effectiveness logger is missing")
+    require((PLUGIN / "scripts" / "codex-gardener-hook.cmd").is_file(), "Windows Hook wrapper is missing")
 
 
 def validate_skills() -> None:
