@@ -18,6 +18,8 @@ The runtime and installer use only the Python standard library.
 
 ## Install from Git
 
+If `codex plugin list --json` shows `codex-gardener@personal` enabled, remove that legacy installation first with `codex plugin remove codex-gardener@personal`; otherwise both copies can contribute matching Hooks and Skills.
+
 ```bash
 codex plugin marketplace add williamxhero/codex-gardener
 codex plugin add codex-gardener@codex-gardener
@@ -34,18 +36,18 @@ python install.py --dry-run
 python install.py
 ```
 
-Use `python3` when `python` is unavailable. The installer locates `codex`, validates the checkout, safely reuses a matching local marketplace, installs `codex-gardener@codex-gardener`, and prints hook-trust and new-task guidance. It stops if the marketplace name already points elsewhere.
+Use `python3` when `python` is unavailable. The installer locates `codex`, validates the checkout, safely reuses a matching local marketplace, installs `codex-gardener@codex-gardener`, and prints hook-trust and new-task guidance. It stops if the marketplace name already points elsewhere or the legacy `codex-gardener@personal` is still enabled. It never removes another installation silently; follow its explicit removal command and rerun it.
 
 ## Architecture
 
 | Component | Role |
 | --- | --- |
 | `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
-| `$gardener-capture` | Classify each lesson as repository or global and append concise evidence without editing promoted artifacts. |
-| `$knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
+| `$codex-gardener:gardener-capture` | Classify each lesson as repository or global and append concise evidence without editing promoted artifacts. |
+| `$codex-gardener:knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
 | `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
-| `$cross-project-delegation` | Move authorized implementation into its owning repository and isolate concurrent writers in unique Git worktrees. |
+| `$codex-gardener:cross-project-delegation` | Move authorized implementation into its owning repository and isolate concurrent writers in unique Git worktrees. |
 
 ### Two knowledge scopes
 
@@ -64,7 +66,7 @@ Global candidates, resolutions, and retrieval indexes live under:
 $CODEX_HOME/codex-gardener-global-learning/
 ```
 
-Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` defaults to `~/.codex`. Runtime state and pending-review records remain under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`.
+Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` defaults to `~/.codex`. Runtime state and pending-review records use the official `PLUGIN_DATA` supplied to Hooks. Gardener writes its resolved location atomically to `$CODEX_HOME/codex-gardener-data-path` so a later CLI audit can find the same data; `CODEX_GARDENER_DATA` remains an explicit diagnostic/test override and `$CODEX_HOME/codex-gardener-data/` is the last-resort fallback.
 
 ## Local effectiveness audit
 
@@ -90,7 +92,7 @@ python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --json
 python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /path/to/repo --json
 ```
 
-Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. Treat these metrics as operational evidence: hit rates and capture rates can reveal whether Gardener is useful or noisy, but do not replace conflict checks or promotion thresholds.
+Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, data-root source, resolved local data/log paths, log existence, latest event time, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
 
 ## Learning and promotion model
 
@@ -110,12 +112,12 @@ Promoted global keyword matches are available in every project context, includin
 
 ## Usage
 
-Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$gardener-capture` can record a bounded retrospective. You can also invoke either workflow directly:
+Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$codex-gardener:gardener-capture` can record a bounded retrospective. You can also invoke either workflow directly:
 
 ```text
-Use $gardener-capture to review this task and record reusable knowledge at the right scope.
-Use $knowledge-curator to curate repository and global lessons at the narrowest valid scope.
-Use $cross-project-delegation to coordinate this change in the project that owns it.
+Use $codex-gardener:gardener-capture to review this task and record reusable knowledge at the right scope.
+Use $codex-gardener:knowledge-curator to curate repository and global lessons at the narrowest valid scope.
+Use $codex-gardener:cross-project-delegation to coordinate this change in the project that owns it.
 ```
 
 For concurrent repository maintenance, the Skill first inspects existing worktrees and branches, pins a base commit, assigns one unique worktree and branch per writer, and forbids shared-checkout writes. One coordinator then merges or cherry-picks branches serially in a dedicated, clean integration worktree and branch—not the shared or main checkout—resolves conflicts there, reruns validation after every merge, and runs the full acceptance suite after final integration. If isolation cannot be established, concurrent writes must stop or be serialized. Worktrees are removed only after their branches and exact resolved paths are verified.
@@ -136,7 +138,7 @@ python gardener.py groups --repo /path/to/repo
 python gardener.py groups --repo /path/to/repo --knowledge-scope global
 ```
 
-Records created before `0.2.0` have no `knowledge_scope`; they continue to load as `repository` and remain in their existing repository store.
+Records created before `0.2.0` inside a repository have no `knowledge_scope`; they continue to load as `repository` and remain in that repository store. Version `0.4.0` also reads legacy user-level `$CODEX_HOME/learning/{inbox,index,resolutions}.jsonl` as global knowledge and copies it into the v2 global store at SessionStart or before a global write. Read-only reports can combine the legacy source in memory without changing it. Copies are marked `migration_provenance: legacy-user-learning-v1`, deduplicated by fingerprint/session or resolution identity, and the source files are preserved. Migrated evidence without project fingerprints cannot by itself satisfy the cross-project global promotion threshold.
 
 ## Update and uninstall
 
@@ -147,7 +149,13 @@ codex plugin marketplace upgrade codex-gardener
 codex plugin add codex-gardener@codex-gardener
 ```
 
-For a cloned installation, run `git pull` and then `python install.py` again. Start a new task after updating. Upgrading from `0.1.x` does not migrate or broaden existing candidates; legacy records stay repository-scoped.
+For a cloned installation, run `git pull` and then `python install.py` again. Start a new task after updating. If an old personal installation is enabled, remove it explicitly first:
+
+```bash
+codex plugin remove codex-gardener@personal
+```
+
+An old standalone `$CODEX_HOME/skills/cross-project-delegation/` may also contain pre-plugin guidance and compete with the bundled Skill. Compare it with `$codex-gardener:cross-project-delegation`; after preserving any unique valid guidance, explicitly remove or rename the standalone copy. The installer and curator report this reconciliation path but never modify a global Skill automatically.
 
 To uninstall:
 

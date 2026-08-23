@@ -24,6 +24,7 @@ python <plugin-root>\scripts\gardener.py effectiveness --since-days 14 --repo <r
 5. Check every candidate for duplication, contradiction, obsolete assumptions, narrowest valid scope, existing enforcement, and sensitive content. Downgrade a purported global lesson to repository scope when it depends on project facts.
 6. After processing or intentionally dismissing a pending retrospective, run `python <plugin-root>\scripts\gardener.py pending-resolve --session-id <session-id>`.
 7. Use the effectiveness report to inspect trigger-to-capture conversion, no-candidate reviews, context hit rates, pending backlog, and resolution mix. Treat it as evidence about Gardener's operation, not as evidence that a lesson is true or eligible for promotion.
+8. If `$CODEX_HOME/skills/cross-project-delegation/` predates the bundled `$codex-gardener:cross-project-delegation`, compare it for stale or conflicting guidance. Propose an exact reconciliation; do not delete or rewrite the standalone global Skill without user confirmation.
 
 ## Decide
 

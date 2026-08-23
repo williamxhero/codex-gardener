@@ -35,7 +35,11 @@ class GardenerTest(unittest.TestCase):
         self.codex_home = Path(self.temp.name) / "codex-home"
         self.env = patch.dict(
             os.environ,
-            {"CODEX_GARDENER_DATA": str(self.data), "CODEX_HOME": str(self.codex_home)},
+            {
+                "CODEX_GARDENER_DATA": str(self.data),
+                "CODEX_HOME": str(self.codex_home),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
             clear=False,
         )
         self.env.start()
@@ -110,7 +114,7 @@ class GardenerTest(unittest.TestCase):
         (self.root / "tracked.txt").write_text("after\n", encoding="utf-8")
         first = self.run_hook("Stop", self.payload(stop_hook_active=False))
         self.assertEqual(first["decision"], "block")
-        self.assertIn("$gardener-capture", first["reason"])
+        self.assertIn("$codex-gardener:gardener-capture", first["reason"])
         second = self.run_hook("Stop", self.payload(stop_hook_active=True))
         self.assertEqual(second, {"continue": True})
         report = gardener.effectiveness_report(14, self.root)
@@ -247,6 +251,59 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertIn("[repository]", gardener.promoted_context(self.root, "legacy context") or "")
         self.assertIsNone(gardener.promoted_context(self.other, "legacy context"))
+
+    def test_user_level_v1_learning_migrates_to_global_store_idempotently(self) -> None:
+        legacy = self.codex_home / "learning"
+        legacy.mkdir(parents=True)
+        candidate = {
+            "schema_version": 1,
+            "id": "legacy-global",
+            "fingerprint": "legacy-global-fingerprint",
+            "session_id": "legacy-global-session",
+            "scope": "coordination",
+            "lesson": "Delegate cross-project writes to the owning project.",
+            "evidence_summary": "Confirmed before knowledge scopes existed.",
+            "recommended_target": "skill",
+            "confidence": 0.9,
+            "created_at": "2026-08-12T00:00:00Z",
+        }
+        index = {
+            "schema_version": 1,
+            "fingerprint": "legacy-global-fingerprint",
+            "summary": "Delegate cross-project writes to the owning project.",
+            "keywords": ["cross-project"],
+            "target_path": "~/.codex/skills/cross-project-delegation/SKILL.md",
+            "promoted_at": "2026-08-12T00:00:01Z",
+        }
+        resolution = {
+            "schema_version": 1,
+            "fingerprint": "legacy-global-fingerprint",
+            "status": "promoted",
+            "summary": index["summary"],
+            "keywords": index["keywords"],
+            "target_path": index["target_path"],
+            "created_at": "2026-08-12T00:00:01Z",
+        }
+        gardener.append_jsonl(legacy / "inbox.jsonl", candidate)
+        gardener.append_jsonl(legacy / "index.jsonl", index)
+        gardener.append_jsonl(legacy / "resolutions.jsonl", resolution)
+
+        first = gardener.aggregate_candidates(self.root, "global")
+        self.assertFalse((self.codex_home / "codex-gardener-global-learning" / "inbox.jsonl").exists())
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        second = gardener.aggregate_candidates(self.other, "global")
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(first[0]["occurrences"], 1)
+        self.assertEqual(first[0]["knowledge_scope"], "global")
+        self.assertIn("legacy-user-learning-v1", json.dumps(first))
+        self.assertIn("[global]", gardener.promoted_context(self.other, "cross-project") or "")
+
+        migrated = gardener.read_jsonl(self.codex_home / "codex-gardener-global-learning" / "inbox.jsonl")
+        self.assertEqual(len(migrated), 1)
+        self.assertEqual(migrated[0]["knowledge_scope"], "global")
+        self.assertEqual(migrated[0]["migration_provenance"], "legacy-user-learning-v1")
+        self.assertEqual(gardener.read_jsonl(legacy / "inbox.jsonl"), [candidate])
 
     def test_records_repository_and_global_candidates_in_separate_stores(self) -> None:
         repository = gardener.record_candidate(self.candidate_args(session_id="repo-session"))
@@ -513,6 +570,46 @@ class GardenerTest(unittest.TestCase):
         self.assertNotIn("Update the parser contract", rendered)
         self.assertNotIn("session-1", rendered)
         self.assertNotIn(str(self.root), rendered)
+
+    def test_effectiveness_health_reports_duplicate_enabled_gardener_plugins(self) -> None:
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        (self.codex_home / "config.toml").write_text(
+            '[plugins."codex-gardener@codex-gardener"]\n'
+            'enabled = true\n\n'
+            '[plugins."codex-gardener@personal"]\n'
+            'enabled = true\n',
+            encoding="utf-8",
+        )
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(
+            report["health"]["enabled_plugin_ids"],
+            ["codex-gardener@codex-gardener", "codex-gardener@personal"],
+        )
+        self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
+        self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
+        self.assertEqual(report["health"]["plugin_version"], "0.4.0")
+
+    def test_fresh_hook_uses_plugin_data_and_writes_session_and_context_events(self) -> None:
+        official_data = Path(self.temp.name) / "official-plugin-data"
+        hook_home = Path(self.temp.name) / "fresh-codex-home"
+        env = os.environ.copy()
+        env.pop("CODEX_GARDENER_DATA", None)
+        env.update({"PLUGIN_DATA": str(official_data), "CODEX_HOME": str(hook_home)})
+        payload = json.dumps(self.payload(session_id="fresh-session", turn_id="fresh-turn"))
+        for event in ("SessionStart", "UserPromptSubmit"):
+            subprocess.run(
+                [sys.executable, str(SCRIPT), "hook", event],
+                input=payload,
+                text=True,
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+        events, corrupt = gardener.effectiveness.read_events(root=official_data)
+        self.assertEqual(corrupt, 0)
+        self.assertEqual([event["event"] for event in events], ["session_start", "context_lookup"])
+        locator = hook_home / "codex-gardener-data-path"
+        self.assertEqual(Path(locator.read_text(encoding="utf-8").strip()), official_data.resolve())
 
     def test_effectiveness_tracks_no_candidate_and_current_pending(self) -> None:
         self.init_git()

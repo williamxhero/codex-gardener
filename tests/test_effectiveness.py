@@ -169,6 +169,14 @@ class EffectivenessTest(unittest.TestCase):
         self.assertEqual(report["events"]["valid"], 1)
         self.assertEqual(report["events"]["corrupt_lines_ignored"], 1)
 
+    def test_summary_marks_missing_log_as_not_observed(self) -> None:
+        report = effectiveness.summarize(root=self.root)
+        self.assertEqual(report["health"]["observation_status"], "not_observed")
+        self.assertTrue(report["health"]["logging_enabled"])
+        self.assertFalse(report["health"]["log_exists"])
+        self.assertIsNone(report["health"]["latest_event_at"])
+        self.assertEqual(report["events"]["valid"], 0)
+
     def test_summary_exposes_learning_denominators_and_distributions(self) -> None:
         common = {"root": self.root, "session": self.session, "project": self.project}
         effectiveness.log_event("session_start", **common)

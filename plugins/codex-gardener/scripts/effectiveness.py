@@ -21,6 +21,7 @@ MAX_BACKUPS = 4
 RETENTION_DAYS = 90
 OPT_OUT_ENV = "CODEX_GARDENER_EFFECTIVENESS_LOG"
 PROCESS_WRITE_LOCK = threading.Lock()
+LOCATOR_NAME = "codex-gardener-data-path"
 
 EVENT_FIELDS: dict[str, set[str]] = {
     "session_start": {"session", "project"},
@@ -78,20 +79,35 @@ def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
 
-def plugin_data_root() -> Path:
+def _write_locator(locator: Path, root: Path) -> None:
+    locator.parent.mkdir(parents=True, exist_ok=True)
+    temp = locator.with_name(locator.name + ".tmp")
+    temp.write_text(str(root.resolve()) + "\n", encoding="utf-8", newline="\n")
+    os.replace(temp, locator)
+
+
+def data_root_info(*, persist_plugin_data: bool = True) -> tuple[Path, str]:
     explicit = os.environ.get("CODEX_GARDENER_DATA")
     plugin_data = os.environ.get("PLUGIN_DATA")
-    locator = codex_home() / "codex-gardener-data-path"
+    locator = codex_home() / LOCATOR_NAME
     if explicit:
-        return Path(explicit)
+        return Path(explicit), "CODEX_GARDENER_DATA"
     if plugin_data:
-        return Path(plugin_data)
+        root = Path(plugin_data)
+        if persist_plugin_data:
+            with contextlib.suppress(OSError):
+                _write_locator(locator, root)
+        return root, "PLUGIN_DATA"
     if locator.is_file():
         with contextlib.suppress(OSError):
             located = locator.read_text(encoding="utf-8").strip()
             if located:
-                return Path(located)
-    return codex_home() / "codex-gardener-data"
+                return Path(located), "locator"
+    return codex_home() / "codex-gardener-data", "default"
+
+
+def plugin_data_root() -> Path:
+    return data_root_info()[0]
 
 
 def log_dir(root: Path | None = None) -> Path:
@@ -272,7 +288,19 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
         raise ValueError("since-days must be non-negative")
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     since = current - timedelta(days=since_days)
-    events, corrupt = read_events(root=root, since=since)
+    resolved_root, root_source = (root, "argument") if root is not None else data_root_info()
+    events, corrupt = read_events(root=resolved_root, since=since)
+    all_events, all_corrupt = read_events(root=resolved_root)
+    paths = event_paths(resolved_root)
+    latest_event_at = max((str(item["created_at"]) for item in all_events), default=None)
+    if not logging_enabled():
+        observation_status = "logging_disabled"
+    elif all_events:
+        observation_status = "observed"
+    elif paths and all_corrupt:
+        observation_status = "unreadable"
+    else:
+        observation_status = "not_observed"
     by_type = Counter(str(item["event"]) for item in events)
     sessions = {str(item["session"]) for item in events if item.get("session")}
     projects = {
@@ -292,6 +320,15 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
             "since_days": since_days,
             "since": since.isoformat(timespec="seconds").replace("+00:00", "Z"),
             "through": current.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        },
+        "health": {
+            "observation_status": observation_status,
+            "logging_enabled": logging_enabled(),
+            "data_root": str(resolved_root.resolve()),
+            "data_root_source": root_source,
+            "log_path": str(log_path(resolved_root).resolve()),
+            "log_exists": bool(paths),
+            "latest_event_at": latest_event_at,
         },
         "events": {
             "valid": len(events),

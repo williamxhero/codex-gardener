@@ -28,6 +28,8 @@ import effectiveness
 
 
 SCHEMA_VERSION = 2
+PLUGIN_ID = "codex-gardener@codex-gardener"
+LEGACY_MIGRATION_PROVENANCE = "legacy-user-learning-v1"
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
@@ -75,24 +77,7 @@ def codex_home() -> Path:
 
 
 def plugin_data_root() -> Path:
-    explicit = os.environ.get("CODEX_GARDENER_DATA")
-    plugin_data = os.environ.get("PLUGIN_DATA")
-    locator = codex_home() / "codex-gardener-data-path"
-    if explicit:
-        root = Path(explicit)
-    elif plugin_data:
-        root = Path(plugin_data)
-        with contextlib.suppress(OSError):
-            locator.parent.mkdir(parents=True, exist_ok=True)
-            locator.write_text(str(root.resolve()), encoding="utf-8")
-    elif locator.is_file():
-        with contextlib.suppress(OSError):
-            located = Path(locator.read_text(encoding="utf-8").strip())
-            if located:
-                return located
-        root = codex_home() / "codex-gardener-data"
-    else:
-        root = codex_home() / "codex-gardener-data"
+    root = effectiveness.plugin_data_root()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -376,7 +361,103 @@ def learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path:
     return repo / ".codex" / "learning"
 
 
+def _migration_key(filename: str, record: dict[str, Any]) -> tuple[str, ...]:
+    if filename == "inbox.jsonl":
+        return (str(record.get("fingerprint") or ""), str(record.get("session_id") or "unknown"))
+    if filename == "index.jsonl":
+        return (str(record.get("fingerprint") or ""),)
+    return (
+        str(record.get("fingerprint") or ""),
+        str(record.get("status") or ""),
+        str(record.get("created_at") or ""),
+    )
+
+
+def _migrated_legacy_record(filename: str, raw: dict[str, Any]) -> dict[str, Any]:
+    record = dict(raw)
+    record["schema_version"] = SCHEMA_VERSION
+    record["knowledge_scope"] = "global"
+    record["migration_provenance"] = LEGACY_MIGRATION_PROVENANCE
+    if filename == "inbox.jsonl":
+        record.setdefault("id", "legacy-" + sha256_text(json_dump(raw))[:24])
+        record.setdefault("session_id", "legacy-unknown")
+    return record
+
+
+def migrate_legacy_global_learning() -> dict[str, int]:
+    legacy = codex_home() / "learning"
+    target = codex_home() / "codex-gardener-global-learning"
+    result: dict[str, int] = {}
+    if not legacy.is_dir() or legacy.resolve() == target.resolve():
+        return result
+    target.mkdir(parents=True, exist_ok=True)
+    ignore = target / ".gitignore"
+    with contextlib.suppress(OSError):
+        existing_ignore = ignore.read_text(encoding="utf-8").splitlines() if ignore.is_file() else []
+        missing_ignore = [
+            name
+            for name in ("inbox.jsonl", "index.jsonl", "resolutions.jsonl")
+            if name not in existing_ignore
+        ]
+        if missing_ignore:
+            ignore.write_text(
+                "\n".join([*existing_ignore, *missing_ignore]).rstrip() + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+    for filename in ("inbox.jsonl", "index.jsonl", "resolutions.jsonl"):
+        source_records = read_jsonl(legacy / filename)
+        if not source_records:
+            continue
+        path = target / filename
+        try:
+            with file_lock(path):
+                current = read_jsonl(path)
+                known = {_migration_key(filename, item) for item in current}
+                additions: list[dict[str, Any]] = []
+                for raw in source_records:
+                    migrated = _migrated_legacy_record(filename, raw)
+                    key = _migration_key(filename, migrated)
+                    if not key[0] or key in known:
+                        continue
+                    known.add(key)
+                    additions.append(migrated)
+                if additions:
+                    temp = path.with_name(path.name + ".tmp")
+                    temp.write_text(
+                        "".join(
+                            json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n"
+                            for item in [*current, *additions]
+                        ),
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    os.replace(temp, path)
+                result[filename] = len(additions)
+        except (OSError, TimeoutError):
+            result[filename] = 0
+    return result
+
+
+def read_learning_records(repo: Path, knowledge_scope: str, filename: str) -> list[dict[str, Any]]:
+    knowledge_scope = normalize_knowledge_scope(knowledge_scope)
+    current = read_jsonl(learning_dir(repo, knowledge_scope) / filename)
+    if knowledge_scope != "global":
+        return current
+    known = {_migration_key(filename, item) for item in current}
+    for raw in read_jsonl(codex_home() / "learning" / filename):
+        migrated = _migrated_legacy_record(filename, raw)
+        key = _migration_key(filename, migrated)
+        if not key[0] or key in known:
+            continue
+        known.add(key)
+        current.append(migrated)
+    return current
+
+
 def ensure_learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path:
+    if normalize_knowledge_scope(knowledge_scope) == "global":
+        migrate_legacy_global_learning()
     root = learning_dir(repo, knowledge_scope)
     root.mkdir(parents=True, exist_ok=True)
     ignore = root / ".gitignore"
@@ -448,15 +529,14 @@ def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
 
 def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> list[dict[str, Any]]:
     knowledge_scope = normalize_knowledge_scope(knowledge_scope)
-    root = learning_dir(repo, knowledge_scope)
     records = [
         record
-        for record in read_jsonl(root / "inbox.jsonl")
+        for record in read_learning_records(repo, knowledge_scope, "inbox.jsonl")
         if stored_knowledge_scope(record.get("knowledge_scope")) == knowledge_scope
     ]
     resolutions = [
         resolution
-        for resolution in read_jsonl(root / "resolutions.jsonl")
+        for resolution in read_learning_records(repo, knowledge_scope, "resolutions.jsonl")
         if stored_knowledge_scope(resolution.get("knowledge_scope")) == knowledge_scope
     ]
     latest_resolution = {str(item.get("fingerprint")): item for item in resolutions if item.get("fingerprint")}
@@ -508,6 +588,7 @@ def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> lis
                 "session_ids": sorted(by_session),
                 "project_fingerprints": projects,
                 "project_count": len(projects),
+                "migration_provenance": exemplar.get("migration_provenance"),
                 "resolution": latest_resolution.get(fingerprint),
             }
         )
@@ -573,7 +654,7 @@ def promoted_context_result(repo: Path, prompt: str) -> tuple[str | None, dict[s
     combined: dict[str, dict[str, Any]] = {}
     available = {"repository": 0, "global": 0}
     for knowledge_scope in ("global", "repository"):
-        for raw_entry in read_jsonl(learning_dir(repo, knowledge_scope) / "index.jsonl"):
+        for raw_entry in read_learning_records(repo, knowledge_scope, "index.jsonl"):
             entry = dict(raw_entry)
             entry["knowledge_scope"] = stored_knowledge_scope(entry.get("knowledge_scope"))
             fingerprint = str(entry.get("fingerprint") or "")
@@ -693,6 +774,7 @@ def complete_review_without_candidate(session_id: str) -> None:
 
 
 def handle_session_start(payload: dict[str, Any]) -> None:
+    migrate_legacy_global_learning()
     path, state = load_state(payload)
     state = new_state(payload)
     save_state(path, state)
@@ -711,7 +793,7 @@ def handle_session_start(payload: dict[str, Any]) -> None:
                         "hookEventName": "SessionStart",
                         "additionalContext": (
                             f"Codex Gardener has {count} unreviewed prior session(s) for this repository. "
-                            "Use $knowledge-curator when retrospective cleanup is appropriate."
+                            "Use $codex-gardener:knowledge-curator when retrospective cleanup is appropriate."
                         ),
                     }
                 }
@@ -810,7 +892,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
         signals=safe_signal_categories(state),
     )
     reason = (
-        "Use $gardener-capture now to review this completed task for reusable knowledge at the right scope. "
+        "Use $codex-gardener:gardener-capture now to review this completed task for reusable knowledge at the right scope. "
         f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
         "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
         "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
@@ -866,6 +948,7 @@ def handle_hook(event: str) -> int:
 
 def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict[str, Any]:
     report = effectiveness.summarize(since_days=since_days)
+    report["health"].update(plugin_health())
     report["reviews"]["current_pending"] = len(pending_records(repo))
     if repo is not None:
         group_status: dict[str, dict[str, int]] = {}
@@ -878,6 +961,52 @@ def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict
     return report
 
 
+def _plugin_version() -> str | None:
+    manifest = load_json_file(SCRIPT_DIR.parent / ".codex-plugin" / "plugin.json", {})
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    return str(version) if version else None
+
+
+def enabled_gardener_plugin_ids(config_path: Path | None = None) -> list[str]:
+    path = config_path or (codex_home() / "config.toml")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    current: str | None = None
+    enabled: dict[str, bool] = {}
+    section = re.compile(
+        r'^\s*\[plugins\.(["\']?)(codex-gardener@[^"\']+)\1\]\s*(?:#.*)?$',
+        re.IGNORECASE,
+    )
+    for line in lines:
+        match = section.match(line)
+        if match:
+            current = match.group(2)
+            enabled.setdefault(current, False)
+            continue
+        if line.lstrip().startswith("["):
+            current = None
+            continue
+        if current and re.match(r"^\s*enabled\s*=\s*true\s*(?:#.*)?$", line, re.IGNORECASE):
+            enabled[current] = True
+    return sorted(plugin_id for plugin_id, is_enabled in enabled.items() if is_enabled)
+
+
+def plugin_health() -> dict[str, Any]:
+    enabled = enabled_gardener_plugin_ids()
+    duplicates = [plugin_id for plugin_id in enabled if plugin_id != PLUGIN_ID]
+    config = codex_home() / "config.toml"
+    return {
+        "plugin_id": PLUGIN_ID,
+        "plugin_version": _plugin_version(),
+        "enabled_plugin_ids": enabled,
+        "duplicate_enabled_plugin_ids": duplicates,
+        "plugin_config_observed": config.is_file(),
+        "legacy_learning_source_exists": (codex_home() / "learning").is_dir(),
+    }
+
+
 def format_effectiveness_report(report: dict[str, Any]) -> str:
     window = report["window"]
     coverage = report["coverage"]
@@ -887,6 +1016,11 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
     lines = [
         f"Codex Gardener effectiveness ({window['since']} through {window['through']})",
         f"Events: {report['events']['valid']} valid, {report['events']['corrupt_lines_ignored']} corrupt ignored",
+        (
+            "Health: "
+            f"{report['health']['observation_status']}; log={report['health']['log_path']}; "
+            f"latest={report['health']['latest_event_at'] or 'never'}"
+        ),
         f"Coverage: {coverage['sessions_observed']} sessions, {coverage['projects_observed']} projects",
         (
             "Reviews: "

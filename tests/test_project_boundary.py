@@ -56,7 +56,7 @@ class ProjectBoundaryTest(unittest.TestCase):
         self.assertIsNotNone(result)
         output = result["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
-        self.assertIn("$cross-project-delegation", output["permissionDecisionReason"])
+        self.assertIn("$codex-gardener:cross-project-delegation", output["permissionDecisionReason"])
         events = project_boundary.effectiveness.read_events(root=self.data)[0]
         self.assertEqual(events[0]["event"], "project_boundary_denied")
         self.assertEqual(events[0]["tool_category"], "patch")
