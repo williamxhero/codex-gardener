@@ -193,6 +193,135 @@ class GardenerTest(unittest.TestCase):
         self.assertIn("inbox.jsonl", ignore)
         self.assertIn("index.jsonl", ignore)
 
+    def test_active_stop_commits_deferred_repository_candidate_once(self) -> None:
+        self.init_git()
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：使用项目约定的入口"))
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+
+        with patch.object(gardener, "state_path", side_effect=AssertionError("defer must stay in workspace")):
+            deferred = gardener.defer_candidate(self.candidate_args())
+        self.assertTrue(deferred["deferred"])
+        marker_directory = gardener.deferred_capture_dir(self.root, "session-1")
+        self.assertEqual(len(list(marker_directory.glob("*.json"))), 1)
+        self.assertIn("deferred-captures/", (self.root / ".codex" / "learning" / ".gitignore").read_text())
+        self.assertFalse((self.root / ".codex" / "learning" / "inbox.jsonl").exists())
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertFalse(marker_directory.exists())
+        records = gardener.read_jsonl(self.root / ".codex" / "learning" / "inbox.jsonl")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["knowledge_scope"], "repository")
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["captures_recorded"], 1)
+        self.assertEqual(report["reviews"]["completed_without_candidate"], 0)
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertEqual(len(gardener.read_jsonl(self.root / ".codex" / "learning" / "inbox.jsonl")), 1)
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["captures_recorded"], 1)
+
+    def test_active_stop_commits_deferred_global_candidate_outside_model_process(self) -> None:
+        self.init_git()
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：这是跨项目原则"))
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        args = self.candidate_args(
+            knowledge_scope="global",
+            lesson="Keep portable capture handoffs independent of repository conventions.",
+            target="skill",
+        )
+        with patch.object(gardener, "state_path", side_effect=AssertionError("defer must stay in workspace")), patch.object(
+            gardener, "learning_dir", wraps=gardener.learning_dir
+        ) as learning_dir:
+            gardener.defer_candidate(args)
+        self.assertTrue(all(call.args[1] != "global" for call in learning_dir.call_args_list if len(call.args) > 1))
+        self.assertFalse((self.codex_home / "codex-gardener-global-learning" / "inbox.jsonl").exists())
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        records = gardener.read_jsonl(self.codex_home / "codex-gardener-global-learning" / "inbox.jsonl")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["knowledge_scope"], "global")
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["captures_recorded"], 1)
+
+    def test_defer_record_cli_needs_only_repository_write_access(self) -> None:
+        env = os.environ.copy()
+        env.pop("CODEX_GARDENER_DATA", None)
+        env.pop("PLUGIN_DATA", None)
+        env.update(
+            {
+                "CODEX_HOME": str(self.codex_home),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "defer-record",
+                "--repo",
+                str(self.root),
+                "--session-id",
+                "sandbox-session",
+                "--knowledge-scope",
+                "global",
+                "--scope",
+                "capture",
+                "--lesson",
+                "Defer formal candidate writes to the active Stop Hook.",
+                "--evidence",
+                "The model process has repository-only write access.",
+                "--target",
+                "hook",
+                "--confidence",
+                "0.9",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+            cwd=self.root,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["deferred"])
+        self.assertEqual(len(list(gardener.deferred_capture_dir(self.root, "sandbox-session").glob("*.json"))), 1)
+        self.assertFalse((self.codex_home / "codex-gardener-global-learning").exists())
+        self.assertFalse((self.codex_home / "codex-gardener-data").exists())
+
+    def test_active_stop_ignores_mismatched_deferred_marker_fail_open(self) -> None:
+        self.init_git()
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：检查错误 marker"))
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        directory = gardener.deferred_capture_dir(self.root, "session-1")
+        directory.mkdir(parents=True)
+        marker = directory / "invalid.json"
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": gardener.SCHEMA_VERSION,
+                    "record_type": "deferred_capture",
+                    "session_id": "different-session",
+                    "knowledge_scope": "repository",
+                    "scope": "tests",
+                    "lesson": "This marker must not be accepted.",
+                    "evidence_summary": "Mismatched session.",
+                    "recommended_target": "test",
+                    "confidence": 0.9,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=True)), {"continue": True})
+        self.assertTrue(marker.exists())
+        state = gardener.load_json_file(gardener.state_path("session-1"), {})
+        self.assertFalse(state["capture_completed"])
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["captures_recorded"], 0)
+        self.assertEqual(report["reviews"]["completed_without_candidate"], 0)
+        self.assertEqual(report["errors"]["count"], 1)
+
     def test_concurrent_candidate_appends_remain_valid_jsonl(self) -> None:
         def write(index: int) -> None:
             gardener.record_candidate(
@@ -590,7 +719,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.4.3")
+        self.assertEqual(report["health"]["plugin_version"], "0.4.4")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 

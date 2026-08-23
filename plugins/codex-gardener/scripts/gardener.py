@@ -33,6 +33,7 @@ LEGACY_MIGRATION_PROVENANCE = "legacy-user-learning-v1"
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
+DEFERRED_CAPTURE_DIR = "deferred-captures"
 CORRECTION_RE = re.compile(
     r"(?:不对|错了|纠正|我说的是|你忘了|没有按|不是.{0,20}而是|"
     r"\bwrong\b|\bincorrect\b|that's not|that is not|i said|you forgot|not what i asked)",
@@ -490,41 +491,192 @@ def candidate_fingerprint(scope: str, lesson: str, target: str) -> str:
     return sha256_text(f"{scope.strip().casefold()}\0{normalize_lesson(lesson)}\0{target}")[:24]
 
 
-def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
-    repo = Path(args.repo).resolve()
+def normalized_candidate_fields(args: argparse.Namespace) -> dict[str, Any]:
     knowledge_scope = normalize_knowledge_scope(getattr(args, "knowledge_scope", "repository"))
-    target = args.target.casefold()
+    session_id = str(args.session_id).strip()
+    scope = str(args.scope).strip()
+    lesson = str(args.lesson).strip()
+    evidence = str(args.evidence).strip()
+    target = str(args.target).casefold()
     if target not in TARGETS:
         raise ValueError(f"target must be one of: {', '.join(sorted(TARGETS))}")
     confidence = float(args.confidence)
     if not 0 <= confidence <= 1:
         raise ValueError("confidence must be between 0 and 1")
-    fingerprint = candidate_fingerprint(args.scope, args.lesson, target)
+    for name, value, limit in (
+        ("session-id", session_id, 256),
+        ("scope", scope, 160),
+        ("lesson", lesson, 2000),
+        ("evidence", evidence, 2000),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        if len(value) > limit:
+            raise ValueError(f"{name} must not exceed {limit} characters")
+    return {
+        "session_id": session_id,
+        "knowledge_scope": knowledge_scope,
+        "scope": scope,
+        "lesson": lesson,
+        "evidence": evidence,
+        "target": target,
+        "confidence": confidence,
+    }
+
+
+def deferred_capture_dir(repo: Path, session_id: str) -> Path:
+    return repo.resolve() / ".codex" / "learning" / DEFERRED_CAPTURE_DIR / safe_name(session_id)
+
+
+def ensure_deferred_capture_dir(repo: Path, session_id: str) -> Path:
+    learning = repo.resolve() / ".codex" / "learning"
+    directory = deferred_capture_dir(repo, session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    ignore = learning / ".gitignore"
+    existing = ignore.read_text(encoding="utf-8").splitlines() if ignore.is_file() else []
+    ignored = f"{DEFERRED_CAPTURE_DIR}/"
+    if ignored not in existing:
+        ignore.write_text("\n".join([*existing, ignored]).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return directory
+
+
+def defer_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    repo = Path(args.repo).resolve()
+    fields = normalized_candidate_fields(args)
+    fingerprint = candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"])
+    marker = {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "deferred_capture",
+        "fingerprint": fingerprint,
+        "session_id": fields["session_id"],
+        "knowledge_scope": fields["knowledge_scope"],
+        "scope": fields["scope"],
+        "lesson": fields["lesson"],
+        "evidence_summary": fields["evidence"],
+        "recommended_target": fields["target"],
+        "confidence": fields["confidence"],
+        "created_at": utc_now(),
+    }
+    path = ensure_deferred_capture_dir(repo, fields["session_id"]) / f"{fingerprint}.json"
+    atomic_write_json(path, marker)
+    return {
+        "deferred": True,
+        "fingerprint": fingerprint,
+        "knowledge_scope": fields["knowledge_scope"],
+        "recommended_target": fields["target"],
+    }
+
+
+def append_candidate_once(path: Path, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        for existing in read_jsonl(path):
+            if (
+                existing.get("fingerprint") == record["fingerprint"]
+                and str(existing.get("session_id") or "") == record["session_id"]
+                and stored_knowledge_scope(existing.get("knowledge_scope")) == record["knowledge_scope"]
+            ):
+                return existing, False
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return record, True
+
+
+def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    repo = Path(args.repo).resolve()
+    fields = normalized_candidate_fields(args)
+    fingerprint = candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"])
     record = {
         "schema_version": SCHEMA_VERSION,
         "id": str(uuid.uuid4()),
         "fingerprint": fingerprint,
-        "session_id": args.session_id,
-        "knowledge_scope": knowledge_scope,
+        "session_id": fields["session_id"],
+        "knowledge_scope": fields["knowledge_scope"],
         "project_fingerprint": project_fingerprint(repo),
-        "scope": args.scope.strip(),
-        "lesson": args.lesson.strip(),
-        "evidence_summary": args.evidence.strip(),
-        "recommended_target": target,
-        "confidence": confidence,
+        "scope": fields["scope"],
+        "lesson": fields["lesson"],
+        "evidence_summary": fields["evidence"],
+        "recommended_target": fields["target"],
+        "confidence": fields["confidence"],
         "created_at": utc_now(),
     }
-    append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "inbox.jsonl", record)
-    mark_review_complete(args.session_id)
-    log_effectiveness(
-        "capture_recorded",
-        session=session_identity(args.session_id),
-        project=project_identity(repo),
-        knowledge_scope=knowledge_scope,
-        recommended_target=target,
-        confidence_bucket=confidence_bucket(confidence),
+    stored, created = append_candidate_once(
+        ensure_learning_dir(repo, fields["knowledge_scope"]) / "inbox.jsonl",
+        record,
     )
-    return record
+    mark_review_complete(fields["session_id"])
+    if created:
+        log_effectiveness(
+            "capture_recorded",
+            session=session_identity(fields["session_id"]),
+            project=project_identity(repo),
+            knowledge_scope=fields["knowledge_scope"],
+            recommended_target=fields["target"],
+            confidence_bucket=confidence_bucket(fields["confidence"]),
+        )
+    return stored
+
+
+def candidate_args_from_marker(repo: Path, expected_session_id: str, marker: dict[str, Any]) -> argparse.Namespace:
+    allowed = {
+        "schema_version",
+        "record_type",
+        "fingerprint",
+        "session_id",
+        "knowledge_scope",
+        "scope",
+        "lesson",
+        "evidence_summary",
+        "recommended_target",
+        "confidence",
+        "created_at",
+    }
+    if set(marker) - allowed:
+        raise ValueError("deferred capture contains unsupported fields")
+    if marker.get("schema_version") != SCHEMA_VERSION or marker.get("record_type") != "deferred_capture":
+        raise ValueError("invalid deferred capture schema")
+    if str(marker.get("session_id") or "") != expected_session_id:
+        raise ValueError("deferred capture session does not match Hook state")
+    args = argparse.Namespace(
+        repo=str(repo),
+        session_id=expected_session_id,
+        knowledge_scope=marker.get("knowledge_scope"),
+        scope=marker.get("scope"),
+        lesson=marker.get("lesson"),
+        evidence=marker.get("evidence_summary"),
+        target=marker.get("recommended_target"),
+        confidence=marker.get("confidence"),
+    )
+    fields = normalized_candidate_fields(args)
+    fingerprint = candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"])
+    if marker.get("fingerprint") != fingerprint:
+        raise ValueError("deferred capture fingerprint is invalid")
+    return args
+
+
+def consume_deferred_candidates(repo: Path, session_id: str) -> tuple[int, int]:
+    processed = 0
+    invalid = 0
+    directory = deferred_capture_dir(repo, session_id)
+    for marker_path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        marker = load_json_file(marker_path, None)
+        if not isinstance(marker, dict):
+            invalid += 1
+            continue
+        try:
+            args = candidate_args_from_marker(repo, session_id, marker)
+            record_candidate(args)
+        except (OSError, TimeoutError, TypeError, ValueError):
+            invalid += 1
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            marker_path.unlink()
+        processed += 1
+    with contextlib.suppress(OSError):
+        directory.rmdir()
+    return processed, invalid
 
 
 def aggregate_candidates(repo: Path, knowledge_scope: str = "repository") -> list[dict[str, Any]]:
@@ -864,10 +1016,18 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
 def handle_stop(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     if payload.get("stop_hook_active"):
+        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
+        repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
+        processed, invalid = consume_deferred_candidates(repo, session_id)
+        if invalid:
+            log_effectiveness("operation_error", operation="record", category="input")
+        if invalid and not processed and not state.get("capture_completed"):
+            emit_json({"continue": True})
+            return
         completed_before_stop = bool(state.get("capture_completed"))
         state["capture_completed"] = True
         save_state(path, state)
-        if not completed_before_stop:
+        if not completed_before_stop and not processed:
             log_effectiveness(
                 "review_completed_no_candidate",
                 session=session_identity(state.get("session_id")),
@@ -896,7 +1056,7 @@ def handle_stop(payload: dict[str, Any]) -> None:
         f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
         "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
         "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
-        "If nothing is reusable, mark the review complete without recording a candidate."
+        "If nothing is reusable, report that outcome without running a completion command."
     )
     emit_json({"decision": "block", "reason": reason})
 
@@ -1052,15 +1212,21 @@ def build_parser() -> argparse.ArgumentParser:
     hook = sub.add_parser("hook")
     hook.add_argument("event", choices=["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"])
 
+    def add_candidate_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--repo", required=True)
+        command.add_argument("--session-id", required=True)
+        command.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
+        command.add_argument("--scope", required=True)
+        command.add_argument("--lesson", required=True)
+        command.add_argument("--evidence", required=True)
+        command.add_argument("--target", required=True, choices=sorted(TARGETS))
+        command.add_argument("--confidence", required=True, type=float)
+
     record = sub.add_parser("record")
-    record.add_argument("--repo", required=True)
-    record.add_argument("--session-id", required=True)
-    record.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
-    record.add_argument("--scope", required=True)
-    record.add_argument("--lesson", required=True)
-    record.add_argument("--evidence", required=True)
-    record.add_argument("--target", required=True, choices=sorted(TARGETS))
-    record.add_argument("--confidence", required=True, type=float)
+    add_candidate_arguments(record)
+
+    deferred = sub.add_parser("defer-record")
+    add_candidate_arguments(deferred)
 
     groups = sub.add_parser("groups")
     groups.add_argument("--repo", required=True)
@@ -1100,6 +1266,8 @@ def main() -> int:
             return handle_hook(args.event)
         if args.command == "record":
             emit_json(record_candidate(args))
+        elif args.command == "defer-record":
+            emit_json(defer_candidate(args))
         elif args.command == "groups":
             emit_json(
                 {

@@ -45,7 +45,7 @@ Use `python3` when `python` is unavailable. The installer locates `codex`, valid
 | Component | Role |
 | --- | --- |
 | `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
-| `$codex-gardener:gardener-capture` | Classify each lesson as repository or global and append concise evidence without editing promoted artifacts. |
+| `$codex-gardener:gardener-capture` | Classify each lesson and defer concise evidence for the unsandboxed Stop Hook without editing promoted artifacts. |
 | `$codex-gardener:knowledge-curator` | Aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
 | `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
@@ -69,6 +69,8 @@ $CODEX_HOME/codex-gardener-global-learning/
 ```
 
 Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` defaults to `~/.codex`. Runtime state and pending-review records use the official `PLUGIN_DATA` supplied to Hooks. Gardener writes its resolved location atomically to `$CODEX_HOME/codex-gardener-data-path` so a later CLI audit can find the same data; `CODEX_GARDENER_DATA` remains an explicit diagnostic/test override and `$CODEX_HOME/codex-gardener-data/` is the last-resort fallback.
+
+Version `0.4.4` makes capture safe under normal `workspace-write` execution. The continued model writes validated `defer-record` markers only under ignored `<repository>/.codex/learning/deferred-captures/`; it never needs model-shell access to plugin data or the global store. The second Stop Hook validates session, schema, allowed fields, scope, target, confidence, and fingerprint, then writes formal repository or global candidates and effectiveness events outside the model sandbox. Repeated Stop delivery is idempotent by fingerprint and session. A no-candidate review runs no model command and is recorded directly by the second Stop Hook. The original `record` and `review-complete` CLI commands remain available for backward-compatible direct use outside restricted model execution.
 
 ## Local effectiveness audit
 
@@ -114,7 +116,7 @@ Promoted global keyword matches are available in every project context, includin
 
 ## Usage
 
-Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$codex-gardener:gardener-capture` can record a bounded retrospective. You can also invoke either workflow directly:
+Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$codex-gardener:gardener-capture` can defer a bounded retrospective for the second Stop Hook. You can also invoke either workflow directly:
 
 ```text
 Use $codex-gardener:gardener-capture to review this task and record reusable knowledge at the right scope.

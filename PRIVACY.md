@@ -11,6 +11,7 @@ The plugin may store:
 - short-lived task state and a pending-review queue under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`;
 - repository paths, task/session identifiers, signal names, timestamps, and—when Codex supplies it—a local transcript path, but not transcript contents;
 - repository-scoped candidate summaries, resolutions, and indexes under `<repository>/.codex/learning/`;
+- short-lived, ignored deferred candidate markers under `<repository>/.codex/learning/deferred-captures/` until the second Stop Hook consumes them;
 - global candidate summaries, resolutions, and indexes under `$CODEX_HOME/codex-gardener-global-learning/`.
 - append-only effectiveness events under `<plugin-data>/effectiveness/`.
 
@@ -19,6 +20,8 @@ Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` J
 Effectiveness events have a strict field allowlist. They may contain counts, fixed categories, timestamps, and truncated SHA-256 hashes used to correlate sessions and projects. They never intentionally contain prompt text, tool input or output, transcript content or paths, file content, secrets, raw repository paths, or raw session/turn IDs. The logger does not record ordinary tool calls. Its active JSONL file rotates at 1 MiB, keeps at most four backups, and removes rotated files older than 90 days. Logging failures fail open and cannot block hooks or CLI operations.
 
 Candidate records contain an explicit knowledge scope, topical scope, concise lesson and evidence summary, confidence, target recommendation, session ID, timestamp, and a one-way project fingerprint. The fingerprint is derived from a normalized Git remote identity when available, otherwise a normalized repository path. Only the truncated SHA-256 hash is stored in candidate records; it is intended to measure evidence diversity, not to anonymize a guessable repository identity.
+
+Deferred markers contain the same concise candidate fields except repository path and project fingerprint. They never contain prompts, transcripts, tool input/output, or caller-supplied target paths. The Stop Hook derives the repository and project fingerprint from trusted session state, validates the marker, writes the formal candidate, and then removes the marker.
 
 The JSONL filenames are listed in a `.gitignore` inside each learning store. They remain local unless you deliberately inspect, copy, sync, or commit them. Promoted repository knowledge may become repository files after review. Promoted global knowledge may become `$CODEX_HOME/AGENTS.md` or a Skill under `$CODEX_HOME/skills/`, but only after the curator proposes the exact change and receives explicit user confirmation.
 

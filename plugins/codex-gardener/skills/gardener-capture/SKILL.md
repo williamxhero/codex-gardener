@@ -15,10 +15,10 @@ Capture only knowledge likely to help a future independent task. Choose the narr
    - Use `repository` for language, framework, layout, architecture, team, deployment, or other project-dependent knowledge.
    - Use `global` only when the lesson is portable across unrelated projects and does not depend on repository conventions. Default uncertainty to `repository`.
 4. Classify its target as `agents`, `skill`, `test`, `hook`, `docs`, or `discard`. Read [classification.md](references/classification.md) when either classification is uncertain.
-5. Record each distinct lesson with the bundled plugin CLI. Resolve `scripts/gardener.py` relative to this Skill directory at `../../scripts/gardener.py` and pass an absolute path:
+5. Defer each distinct lesson with the bundled plugin CLI. Resolve `scripts/gardener.py` relative to this Skill directory at `../../scripts/gardener.py` and pass an absolute path. `defer-record` writes only an ignored marker inside the current repository; the unsandboxed second Stop Hook validates it and writes the formal repository or global candidate:
 
 ```powershell
-python <plugin-root>\scripts\gardener.py record `
+python <plugin-root>\scripts\gardener.py defer-record `
   --repo <repository-root> `
   --session-id <session-id> `
   --knowledge-scope <repository|global> `
@@ -29,10 +29,10 @@ python <plugin-root>\scripts\gardener.py record `
   --confidence <0-to-1>
 ```
 
-6. If nothing is reusable, run `python <plugin-root>\scripts\gardener.py review-complete --session-id <session-id>`.
-7. Report what was recorded and at which knowledge scope, or state that the review produced no candidate.
+6. If nothing is reusable, do not run a command. State that the review produced no candidate; the second Stop Hook records the no-candidate completion.
+7. Report what was deferred and at which knowledge scope, or state that the review produced no candidate.
 
-The CLI records only a low-sensitivity effectiveness event for the outcome: hashed session/project identities, scope, target, and confidence bucket, or completion without a candidate. Do not add prompts, tool data, paths, or transcript content to support that audit.
+The deferred marker contains only the candidate fields shown above and no repository path. The second Stop Hook records a low-sensitivity effectiveness event for the outcome: hashed session/project identities, scope, target, and confidence bucket, or completion without a candidate. Do not add prompts, tool data, paths, or transcript content to support that audit.
 
 ## Boundaries
 

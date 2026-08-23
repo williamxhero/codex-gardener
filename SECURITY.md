@@ -12,6 +12,8 @@ Codex Gardener runs local Python commands at Codex lifecycle boundaries. Review 
 
 Knowledge candidates are untrusted input. Review evidence and scope before promotion, keep secrets out of summaries, inspect every diff, and preserve normal repository review and CI controls. Global promotion has wider impact and must remain confirmation-gated. Project fingerprints are diversity signals, not security identities or proof of project independence. Install only from a repository and Git ref you trust.
 
+Deferred capture markers are also untrusted input. The Stop Hook accepts them only from the current repository and hashed session directory, rejects unknown fields or mismatched session/schema/fingerprint data, and derives all write destinations itself. Invalid markers fail open without being promoted or falsely counted as a no-candidate review.
+
 Effectiveness logs are local operational records, not a security boundary or tamper-proof audit trail. Their schema rejects fields outside a small allowlist and hashes correlating identifiers, but local users and processes with filesystem access can read, change, or delete them. Logging and rotation failures fail open so they never interrupt a Codex hook or Gardener CLI operation. Set `CODEX_GARDENER_EFFECTIVENESS_LOG=0` to disable these events.
 
 Do not keep both `codex-gardener@personal` and `codex-gardener@codex-gardener` enabled: Codex may run matching Hooks from both installations. Version `0.4.0` reports this duplicate state and the cloned installer fails with an explicit removal command rather than deleting another installation. The health report prints local data, log, and standalone Skill paths for diagnosis; avoid publishing that report without reviewing those paths.

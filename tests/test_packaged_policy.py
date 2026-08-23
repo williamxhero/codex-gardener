@@ -10,11 +10,11 @@ PLUGIN = ROOT / "plugins" / "codex-gardener"
 
 
 class PackagedPolicyTest(unittest.TestCase):
-    def test_manifest_version_is_0_4_3(self) -> None:
+    def test_manifest_version_is_0_4_4(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.4.3")
+        self.assertEqual(manifest["version"], "0.4.4")
 
     def test_delegation_skill_requires_isolated_concurrent_writers(self) -> None:
         skill = (
@@ -36,6 +36,12 @@ class PackagedPolicyTest(unittest.TestCase):
         for phrase in required_phrases:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)
+
+    def test_capture_skill_requires_no_command_for_no_candidate(self) -> None:
+        skill = (PLUGIN / "skills" / "gardener-capture" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("review-complete", skill)
+        self.assertIn("do not run a command", skill.casefold())
+        self.assertIn("defer-record", skill)
 
 
 if __name__ == "__main__":
