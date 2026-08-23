@@ -1087,6 +1087,105 @@ class GardenerTest(unittest.TestCase):
         self.assertTrue(self.run_cli("audit-status")["due"])
         self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
 
+    def test_conditional_audit_marker_stays_silent_when_not_due(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="Check only when due. [codex-gardener:scheduled-audit-check]"),
+        )
+
+        result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+
+        self.assertEqual(result, {"continue": True})
+        state = gardener.load_json_file(gardener.state_path("session-1"), {})
+        self.assertTrue(state["check_audit"])
+        self.assertNotIn("scheduled-audit-check", json.dumps(state))
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
+
+    def test_conditional_audit_marker_requests_due_audit_exactly_once(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"conditional-due-{index}")
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="[codex-gardener:scheduled-audit-check]"),
+        )
+
+        first = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        second = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        active = self.run_hook("Stop", self.payload(stop_hook_active=True))
+
+        self.assertEqual(first["decision"], "block")
+        self.assertIn("Audit reason: review_threshold", first["reason"])
+        self.assertEqual(second, {"continue": True})
+        self.assertEqual(active, {"continue": True})
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 1)
+
+    def test_conditional_audit_marker_near_match_does_not_request_due_audit(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"conditional-near-{index}")
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "UserPromptSubmit",
+            self.payload(prompt="[codex-gardener:scheduled-audit-checks]"),
+        )
+
+        result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+
+        self.assertEqual(result, {"continue": True})
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
+
+    def test_combined_maintenance_and_audit_check_prioritizes_pending_work(self) -> None:
+        pending = self.queue_pending("source-session")
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"maintenance-priority-{index}")
+        maintenance = self.payload(
+            session_id="maintenance-session",
+            turn_id="maintenance-turn",
+            cwd=str(self.other),
+            prompt=(
+                "[codex-gardener:scheduled-maintenance] "
+                "[codex-gardener:scheduled-audit-check]"
+            ),
+        )
+        self.run_hook("SessionStart", maintenance)
+        self.run_hook("UserPromptSubmit", maintenance)
+
+        requested = self.run_hook("Stop", maintenance | {"stop_hook_active": False})
+
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn("maintenance-only mode", requested["reason"])
+        self.assertIn(pending["pending_id"], requested["reason"])
+        self.assertNotIn("audit-only", requested["reason"])
+        self.assertEqual(gardener.effectiveness_report(14, self.other)["audits"]["requested"], 0)
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+
+    def test_combined_maintenance_and_audit_check_audits_when_due_and_queue_empty(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"empty-maintenance-{index}")
+        payload = self.payload(
+            prompt=(
+                "[codex-gardener:scheduled-maintenance] "
+                "[codex-gardener:scheduled-audit-check]"
+            )
+        )
+        self.run_hook("SessionStart", payload)
+        self.run_hook("UserPromptSubmit", payload)
+
+        requested = self.run_hook("Stop", payload | {"stop_hook_active": False})
+
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn("audit-only", requested["reason"])
+        self.assertIn("Audit reason: review_threshold", requested["reason"])
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 1)
+
     def test_edit_triggers_once_and_active_stop_does_not_loop(self) -> None:
         self.init_git()
         self.run_hook("SessionStart", self.payload(source="startup"))
@@ -1936,7 +2035,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.6.0")
+        self.assertEqual(report["health"]["plugin_version"], "0.6.1")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 

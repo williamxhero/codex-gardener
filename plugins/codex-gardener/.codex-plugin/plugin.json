@@ -1,6 +1,6 @@
 {
   "name": "codex-gardener",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Silently queue Codex task lessons, curate them at the right scope, and audit local effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",

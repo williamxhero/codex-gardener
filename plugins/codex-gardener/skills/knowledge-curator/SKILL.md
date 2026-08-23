@@ -46,7 +46,7 @@ Maintenance-only mode must not promote, propose, discard, or otherwise resolve c
 
 ## Audit-only mode
 
-When the fixed scheduled audit task requests audit-only work, keep the entire review read-only. A count/time deadline shown by `audit-status` never interrupts an ordinary task or a maintenance continuation:
+When the fixed scheduled audit task requests audit-only work, keep the entire review read-only. The unconditional `[codex-gardener:scheduled-audit]` marker always requests this mode. The conditional `[codex-gardener:scheduled-audit-check]` marker requests it only when the audit status is due. If a fixed task contains both the conditional marker and `[codex-gardener:scheduled-maintenance]`, maintenance takes priority when pending work exists; the audit waits for the next scheduled run. A count/time deadline shown by `audit-status` never interrupts an ordinary task or a maintenance continuation:
 
 1. Run the repository and global `groups`, repository `pending`, `effectiveness --json`, and `audit-status` commands shown below. Inspect trigger-to-terminal conversion, no-candidate reviews, pending backlog, candidate status and scope, resolution mix, context retrieval, conflicts, and stale or superseded knowledge.
 2. Sample relevant repository and global AGENTS.md guidance, Skills, docs, tests, and Hooks only as needed to judge accuracy, brevity, conflicts, staleness, and whether global lessons truly hold across unrelated projects.

@@ -49,6 +49,7 @@ DEFAULT_AUDIT_MAX_DAYS = 7
 DEFAULT_MAINTENANCE_BATCH = 3
 PENDING_CLAIM_TTL_SECONDS = 60 * 60
 SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
+SCHEDULED_AUDIT_CHECK_MARKER = "[codex-gardener:scheduled-audit-check]"
 SCHEDULED_MAINTENANCE_MARKER = "[codex-gardener:scheduled-maintenance]"
 AUDIT_REASONS = {"review_threshold", "elapsed_time", "forced", "scheduled"}
 WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s'\"(])(?:[A-Za-z]:[\\/]|\\\\)")
@@ -404,6 +405,7 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "audit_reason": None,
         "continuation_kind": None,
         "force_audit": False,
+        "check_audit": False,
         "force_maintenance": False,
         "pending_id": None,
         "maintenance_pending_ids": [],
@@ -1770,6 +1772,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "audit_reason": None,
                 "continuation_kind": None,
                 "force_audit": SCHEDULED_AUDIT_MARKER in prompt,
+                "check_audit": SCHEDULED_AUDIT_CHECK_MARKER in prompt,
                 "force_maintenance": SCHEDULED_MAINTENANCE_MARKER in prompt,
                 "pending_id": None,
                 "maintenance_pending_ids": [],
@@ -1780,6 +1783,8 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
             state["correction_signal"] = True
         if SCHEDULED_AUDIT_MARKER in prompt:
             state["force_audit"] = True
+        if SCHEDULED_AUDIT_CHECK_MARKER in prompt:
+            state["check_audit"] = True
         if SCHEDULED_MAINTENANCE_MARKER in prompt:
             state["force_maintenance"] = True
     save_state(path, state)
@@ -1826,7 +1831,14 @@ def handle_stop(payload: dict[str, Any]) -> None:
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
     repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
     continuation_kind = str(state.get("continuation_kind") or "")
-    audit_expected = bool(state.get("force_audit") or state.get("audit_requested") or continuation_kind == "audit")
+    conditional_status = audit_status(initialize=True) if state.get("check_audit") else None
+    conditional_due = bool(conditional_status and conditional_status.get("due"))
+    audit_expected = bool(
+        state.get("force_audit")
+        or conditional_due
+        or state.get("audit_requested")
+        or continuation_kind == "audit"
+    )
     audit_processed, audit_invalid = (
         consume_deferred_audits(
             repo,
@@ -1930,29 +1942,35 @@ def handle_stop(payload: dict[str, Any]) -> None:
             return
         if not batch:
             save_state(path, state)
-            emit_json({"continue": True})
+            if not conditional_due:
+                emit_json({"continue": True})
+                return
+        else:
+            pending_ids = [str(record["pending_id"]) for record in batch]
+            state["maintenance_pending_ids"] = pending_ids
+            state["continuation_kind"] = "maintenance"
+            save_state(path, state)
+            repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
+            reason = (
+                "Use $codex-gardener:knowledge-curator now in maintenance-only mode. "
+                f"Maintenance session ID: {session_id}. Maintenance repository: {repository}. "
+                f"Review only these pending IDs (maximum {DEFAULT_MAINTENANCE_BATCH}): {', '.join(pending_ids)}. "
+                "For each ID, write exactly one sandbox-safe deferred pending outcome described by the Skill. "
+                "Do not promote or resolve candidate status, and do not edit AGENTS.md, Skills, docs, tests, Hooks, "
+                "configuration, plugin files, or any source repository."
+            )
+            emit_json({"decision": "block", "reason": reason})
             return
-        pending_ids = [str(record["pending_id"]) for record in batch]
-        state["maintenance_pending_ids"] = pending_ids
-        state["continuation_kind"] = "maintenance"
-        save_state(path, state)
-        repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
-        reason = (
-            "Use $codex-gardener:knowledge-curator now in maintenance-only mode. "
-            f"Maintenance session ID: {session_id}. Maintenance repository: {repository}. "
-            f"Review only these pending IDs (maximum {DEFAULT_MAINTENANCE_BATCH}): {', '.join(pending_ids)}. "
-            "For each ID, write exactly one sandbox-safe deferred pending outcome described by the Skill. "
-            "Do not promote or resolve candidate status, and do not edit AGENTS.md, Skills, docs, tests, Hooks, "
-            "configuration, plugin files, or any source repository."
-        )
-        emit_json({"decision": "block", "reason": reason})
-        return
-    should_audit = bool(state.get("force_audit"))
+    should_audit = bool(state.get("force_audit") or conditional_due)
     if state.get("review_requested") or state.get("audit_requested") or not should_audit:
         save_state(path, state)
         emit_json({"continue": True})
         return
-    audit_reason = "forced"
+    audit_reason = (
+        "forced"
+        if state.get("force_audit")
+        else str((conditional_status or {}).get("reason") or "elapsed_time")
+    )
     state["audit_requested"] = True
     state["audit_reason"] = audit_reason
     state["continuation_kind"] = "audit"
@@ -1985,6 +2003,7 @@ def handle_session_end(payload: dict[str, Any]) -> None:
         and not state.get("capture_completed")
         and not state.get("force_maintenance")
         and not state.get("force_audit")
+        and not state.get("check_audit")
         and continuation_kind not in {"maintenance", "audit"}
     ):
         try:

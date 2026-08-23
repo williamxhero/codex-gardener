@@ -10,11 +10,11 @@ PLUGIN = ROOT / "plugins" / "codex-gardener"
 
 
 class PackagedPolicyTest(unittest.TestCase):
-    def test_manifest_version_is_0_6_0(self) -> None:
+    def test_manifest_version_is_0_6_1(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.6.0")
+        self.assertEqual(manifest["version"], "0.6.1")
 
     def test_stop_timeout_covers_bounded_maintenance_processing(self) -> None:
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
@@ -83,6 +83,12 @@ class PackagedPolicyTest(unittest.TestCase):
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)
+
+    def test_curator_skill_documents_due_only_scheduled_audit_check(self) -> None:
+        skill = (PLUGIN / "skills" / "knowledge-curator" / "SKILL.md").read_text(encoding="utf-8").casefold()
+        self.assertIn("[codex-gardener:scheduled-audit-check]", skill)
+        self.assertIn("only when the audit status is due", skill)
+        self.assertIn("maintenance takes priority", skill)
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ Scheduled audits are read-only by contract. Ordinary count/time deadlines never 
 
 Ordinary Stop processing is short and never waits for a model. The Stop command has a 15-second timeout because a scheduled maintenance second Stop may validate and commit three independently locked outcomes. SessionEnd remains capped at three seconds and only performs the idempotent pending fallback plus state cleanup.
 
-The exact scheduled prompt markers are routing signals, not authentication tokens. Use them only in the fixed Gardener maintenance and audit tasks. Near matches do nothing, but any task that deliberately includes an exact marker can request the corresponding bounded continuation.
+The exact scheduled prompt markers are routing signals, not authentication tokens. Use them only in the fixed Gardener maintenance and audit tasks. Near matches do nothing, but any task that deliberately includes an exact marker can request the corresponding bounded continuation. The conditional audit-check marker can request audit-only work only while the trusted local audit checkpoint reports the count or time threshold as due; the existing scheduled-audit marker remains unconditional.
 
 Effectiveness logs are local operational records, not a security boundary or tamper-proof audit trail. Their schema rejects fields outside a small allowlist and hashes correlating identifiers, but local users and processes with filesystem access can read, change, or delete them. Logging and rotation failures fail open so they never interrupt a Codex hook or Gardener CLI operation. Set `CODEX_GARDENER_EFFECTIVENESS_LOG=0` to disable these events.
 

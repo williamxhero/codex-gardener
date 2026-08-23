@@ -1,5 +1,5 @@
 {
-  "description": "Collect low-risk task signals, queue reviews silently, and run only explicitly scheduled maintenance continuations.",
+  "description": "Collect low-risk task signals, queue reviews silently, and run only explicitly scheduled maintenance or audit continuations.",
   "hooks": {
     "PreToolUse": [
       {
