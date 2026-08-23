@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.3.1", "Plugin version must be 0.3.1")
+    require(data.get("version") == "0.4.0", "Plugin version must be 0.4.0")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -110,7 +110,7 @@ def validate_skills() -> None:
         openai_yaml = directory / "agents" / "openai.yaml"
         require(openai_yaml.is_file(), f"Missing agents/openai.yaml for {name}")
         yaml_text = openai_yaml.read_text(encoding="utf-8")
-        require(f"${name}" in yaml_text, f"Default prompt must mention ${name}")
+        require(f"$codex-gardener:{name}" in yaml_text, f"Default prompt must mention the namespaced Skill: {name}")
 
     delegation = (skills / "cross-project-delegation" / "SKILL.md").read_text(encoding="utf-8").lower()
     for requirement in (
@@ -149,6 +149,9 @@ def validate_hygiene() -> None:
     require("codex-gardener-global-learning" in gardener_source, "Global learning store path is missing")
     require("knowledge_scope" in gardener_source, "Knowledge scope schema is missing")
     require('sub.add_parser("effectiveness")' in gardener_source, "Effectiveness CLI is missing")
+    require("observation_status" in effectiveness_source, "Effectiveness health status is missing")
+    require("legacy-user-learning-v1" in gardener_source, "Legacy user learning migration is missing")
+    require("duplicate_enabled_plugin_ids" in gardener_source, "Duplicate plugin detection is missing")
     require("CODEX_GARDENER_EFFECTIVENESS_LOG" in effectiveness_source, "Effectiveness opt-out is missing")
     require("MAX_LOG_BYTES" in effectiveness_source and "MAX_BACKUPS" in effectiveness_source, "Effectiveness rotation bounds are missing")
     for document in (ROOT / "README.md", ROOT / "PRIVACY.md", ROOT / "SECURITY.md"):

@@ -16,8 +16,9 @@ SPEC.loader.exec_module(installer)
 
 
 class FakeRunner:
-    def __init__(self, marketplaces=None, failure_command=None):
+    def __init__(self, marketplaces=None, installed=None, failure_command=None):
         self.marketplaces = marketplaces or []
+        self.installed = installed or []
         self.failure_command = failure_command
         self.commands: list[list[str]] = []
 
@@ -30,6 +31,13 @@ class FakeRunner:
                 command,
                 0,
                 stdout=json.dumps({"marketplaces": self.marketplaces}),
+                stderr="",
+            )
+        if command[-3:] == ["plugin", "list", "--json"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps({"installed": self.installed, "available": []}),
                 stderr="",
             )
         return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
@@ -51,7 +59,13 @@ class InstallTest(unittest.TestCase):
         runner = FakeRunner()
         code, output, error = self.run_main(runner, ["--dry-run"])
         self.assertEqual(code, 0, error)
-        self.assertEqual(runner.commands, [["codex", "plugin", "marketplace", "list", "--json"]])
+        self.assertEqual(
+            runner.commands,
+            [
+                ["codex", "plugin", "marketplace", "list", "--json"],
+                ["codex", "plugin", "list", "--json"],
+            ],
+        )
         self.assertIn("marketplace add", output)
         self.assertIn("plugin add codex-gardener@codex-gardener", output)
         self.assertIn("no marketplace or plugin changes", output)
@@ -60,9 +74,9 @@ class InstallTest(unittest.TestCase):
         runner = FakeRunner()
         code, output, error = self.run_main(runner)
         self.assertEqual(code, 0, error)
-        self.assertEqual(len(runner.commands), 3)
-        self.assertEqual(runner.commands[1][1:4], ["plugin", "marketplace", "add"])
-        self.assertEqual(runner.commands[2][1:], ["plugin", "add", "codex-gardener@codex-gardener"])
+        self.assertEqual(len(runner.commands), 4)
+        self.assertEqual(runner.commands[2][1:4], ["plugin", "marketplace", "add"])
+        self.assertEqual(runner.commands[3][1:], ["plugin", "add", "codex-gardener@codex-gardener"])
         self.assertIn("run /hooks", output)
         self.assertIn("new task", output)
 
@@ -70,7 +84,7 @@ class InstallTest(unittest.TestCase):
         runner = FakeRunner([{"name": "codex-gardener", "root": str(installer.REPO_ROOT)}])
         code, output, error = self.run_main(runner)
         self.assertEqual(code, 0, error)
-        self.assertEqual(len(runner.commands), 2)
+        self.assertEqual(len(runner.commands), 3)
         self.assertEqual(runner.commands[-1][1:], ["plugin", "add", "codex-gardener@codex-gardener"])
         self.assertIn("already points to this checkout", output)
 
@@ -78,7 +92,7 @@ class InstallTest(unittest.TestCase):
         runner = FakeRunner([{"name": "codex-gardener", "root": str(installer.REPO_ROOT.parent)}])
         code, _, error = self.run_main(runner)
         self.assertEqual(code, 1)
-        self.assertEqual(len(runner.commands), 1)
+        self.assertEqual(len(runner.commands), 2)
         self.assertIn("different location", error)
         self.assertIn("marketplace remove codex-gardener", error)
 
@@ -87,6 +101,22 @@ class InstallTest(unittest.TestCase):
         code, _, error = self.run_main(runner)
         self.assertEqual(code, 1)
         self.assertIn("simulated failure", error)
+
+    def test_legacy_personal_install_fails_with_explicit_removal_command(self) -> None:
+        runner = FakeRunner(
+            installed=[
+                {
+                    "pluginId": "codex-gardener@personal",
+                    "name": "codex-gardener",
+                    "installed": True,
+                    "enabled": True,
+                }
+            ]
+        )
+        code, _, error = self.run_main(runner)
+        self.assertEqual(code, 1)
+        self.assertIn("codex plugin remove codex-gardener@personal", error)
+        self.assertFalse(any(command[1:3] == ["plugin", "add"] for command in runner.commands))
 
 
 if __name__ == "__main__":

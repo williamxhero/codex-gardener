@@ -172,7 +172,7 @@ def denial(payload: dict[str, Any]) -> dict[str, Any] | None:
         )
         reason = (
             f"Cross-project write blocked: the target belongs to {owner}, while this task's primary "
-            f"repository is {primary}. Use $cross-project-delegation and perform the change in an "
+            f"repository is {primary}. Use $codex-gardener:cross-project-delegation and perform the change in an "
             "agent or task whose working project is the target repository."
         )
         return {

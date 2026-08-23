@@ -1,6 +1,6 @@
 # Privacy
 
-Codex Gardener is a local Codex plugin. Its Python code makes no network requests and includes no network telemetry, remote analytics service, or credential collection. Version `0.3.0` adds an optional local effectiveness log so users can audit whether the plugin is useful. Codex itself may communicate with services according to your Codex configuration and OpenAI's applicable policies.
+Codex Gardener is a local Codex plugin. Its Python code makes no network requests and includes no network telemetry, remote analytics service, or credential collection. Its optional local effectiveness log lets users audit whether the plugin is useful. Codex itself may communicate with services according to your Codex configuration and OpenAI's applicable policies.
 
 ## Data processed
 
@@ -13,6 +13,8 @@ The plugin may store:
 - repository-scoped candidate summaries, resolutions, and indexes under `<repository>/.codex/learning/`;
 - global candidate summaries, resolutions, and indexes under `$CODEX_HOME/codex-gardener-global-learning/`.
 - append-only effectiveness events under `<plugin-data>/effectiveness/`.
+
+Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` JSONL into the v2 global store with migration provenance. It does not delete or rewrite the legacy source. The local effectiveness report may print resolved runtime and log paths for diagnosis, but those raw paths are not stored in effectiveness events.
 
 Effectiveness events have a strict field allowlist. They may contain counts, fixed categories, timestamps, and truncated SHA-256 hashes used to correlate sessions and projects. They never intentionally contain prompt text, tool input or output, transcript content or paths, file content, secrets, raw repository paths, or raw session/turn IDs. The logger does not record ordinary tool calls. Its active JSONL file rotates at 1 MiB, keeps at most four backups, and removes rotated files older than 90 days. Logging failures fail open and cannot block hooks or CLI operations.
 
@@ -27,6 +29,7 @@ Disable or untrust the hooks in Codex to stop lifecycle processing. Uninstalling
 ```text
 <repository>/.codex/learning/
 $CODEX_HOME/codex-gardener-global-learning/
+$CODEX_HOME/learning/  (legacy source, when present)
 $CODEX_HOME/codex-gardener-data/
 ```
 

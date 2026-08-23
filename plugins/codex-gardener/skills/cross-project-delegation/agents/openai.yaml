@@ -1,4 +1,4 @@
 interface:
   display_name: "Safe Write Delegation"
   short_description: "Delegate writes with project and worktree isolation"
-  default_prompt: "Use $cross-project-delegation to keep cross-project work in its owning project and isolate concurrent writers in unique Git worktrees."
+  default_prompt: "Use $codex-gardener:cross-project-delegation to keep cross-project work in its owning project and isolate concurrent writers in unique Git worktrees."
