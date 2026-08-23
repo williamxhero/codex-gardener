@@ -4,8 +4,10 @@ import importlib.util
 import io
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "install.py"
@@ -117,6 +119,19 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("codex plugin remove codex-gardener@personal", error)
         self.assertFalse(any(command[1:3] == ["plugin", "add"] for command in runner.commands))
+
+    def test_reports_standalone_delegation_skill_without_modifying_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            codex_home = Path(temp) / "codex-home"
+            standalone = codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
+            standalone.parent.mkdir(parents=True)
+            standalone.write_text("legacy guidance\n", encoding="utf-8")
+            with patch.dict("os.environ", {"CODEX_HOME": str(codex_home)}):
+                code, output, error = self.run_main(FakeRunner(), ["--dry-run"])
+            self.assertEqual(code, 0, error)
+            self.assertIn("standalone Skill detected", output)
+            self.assertIn("$codex-gardener:cross-project-delegation", output)
+            self.assertEqual(standalone.read_text(encoding="utf-8"), "legacy guidance\n")
 
 
 if __name__ == "__main__":

@@ -92,7 +92,7 @@ python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --json
 python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /path/to/repo --json
 ```
 
-Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, data-root source, resolved local data/log paths, log existence, latest event time, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
+Without `--repo`, the report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, standalone cross-project Skill detection, data-root source, resolved local data/log paths, log existence, latest event time, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
 
 ## Learning and promotion model
 

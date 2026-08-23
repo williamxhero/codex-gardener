@@ -573,6 +573,9 @@ class GardenerTest(unittest.TestCase):
 
     def test_effectiveness_health_reports_duplicate_enabled_gardener_plugins(self) -> None:
         self.codex_home.mkdir(parents=True, exist_ok=True)
+        standalone = self.codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
+        standalone.parent.mkdir(parents=True, exist_ok=True)
+        standalone.write_text("legacy guidance\n", encoding="utf-8")
         (self.codex_home / "config.toml").write_text(
             '[plugins."codex-gardener@codex-gardener"]\n'
             'enabled = true\n\n'
@@ -588,6 +591,8 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
         self.assertEqual(report["health"]["plugin_version"], "0.4.0")
+        self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
+        self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 
     def test_fresh_hook_uses_plugin_data_and_writes_session_and_context_events(self) -> None:
         official_data = Path(self.temp.name) / "official-plugin-data"

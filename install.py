@@ -89,6 +89,11 @@ def validate_checkout(repo_root: Path) -> None:
         raise InstallError("This does not look like a complete Codex Gardener checkout. Missing: " + ", ".join(missing))
 
 
+def standalone_delegation_skill() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    return codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
+
+
 def install(
     repo_root: Path,
     codex: str,
@@ -101,6 +106,7 @@ def install(
     validate_checkout(repo_root)
     marketplaces = read_marketplaces(codex, runner)
     installed = read_installed_plugins(codex, runner)
+    standalone_skill = standalone_delegation_skill()
     legacy = next(
         (
             item
@@ -112,10 +118,17 @@ def install(
         None,
     )
     if legacy is not None:
+        standalone_note = (
+            f" A standalone Skill also exists at {standalone_skill}; compare it with the bundled namespaced Skill "
+            "and remove or rename it only after preserving any unique valid guidance."
+            if standalone_skill.is_file()
+            else ""
+        )
         raise InstallError(
             f"Legacy {LEGACY_PLUGIN_SELECTOR} is still enabled and would duplicate hooks and Skills. "
             f"Remove it explicitly with 'codex plugin remove {LEGACY_PLUGIN_SELECTOR}', then run this installer again. "
             "This installer will not delete another installation automatically."
+            + standalone_note
         )
     existing = next((item for item in marketplaces if item.get("name") == MARKETPLACE_NAME), None)
 
@@ -145,6 +158,13 @@ def install(
         run_command(add_plugin, runner)
         print("Codex Gardener is installed.", file=output)
 
+    if standalone_skill.is_file():
+        print(
+            f"Warning: standalone Skill detected at {standalone_skill}. It may compete with "
+            "$codex-gardener:cross-project-delegation; compare them and remove or rename the standalone copy "
+            "only after preserving any unique valid guidance.",
+            file=output,
+        )
     print("Next: open Codex, run /hooks, and review and trust the hook commands before enabling them.", file=output)
     print("Then start a new task so Codex discovers the bundled skills and hooks.", file=output)
 

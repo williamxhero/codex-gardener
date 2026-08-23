@@ -14,7 +14,7 @@ The plugin may store:
 - global candidate summaries, resolutions, and indexes under `$CODEX_HOME/codex-gardener-global-learning/`.
 - append-only effectiveness events under `<plugin-data>/effectiveness/`.
 
-Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` JSONL into the v2 global store with migration provenance. It does not delete or rewrite the legacy source. The local effectiveness report may print resolved runtime and log paths for diagnosis, but those raw paths are not stored in effectiveness events.
+Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` JSONL into the v2 global store with migration provenance. It does not delete or rewrite the legacy source. The local effectiveness report may print resolved runtime, log, and standalone Skill paths for diagnosis, but those raw paths are not stored in effectiveness events.
 
 Effectiveness events have a strict field allowlist. They may contain counts, fixed categories, timestamps, and truncated SHA-256 hashes used to correlate sessions and projects. They never intentionally contain prompt text, tool input or output, transcript content or paths, file content, secrets, raw repository paths, or raw session/turn IDs. The logger does not record ordinary tool calls. Its active JSONL file rotates at 1 MiB, keeps at most four backups, and removes rotated files older than 90 days. Logging failures fail open and cannot block hooks or CLI operations.
 

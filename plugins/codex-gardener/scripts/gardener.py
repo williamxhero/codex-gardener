@@ -997,6 +997,7 @@ def plugin_health() -> dict[str, Any]:
     enabled = enabled_gardener_plugin_ids()
     duplicates = [plugin_id for plugin_id in enabled if plugin_id != PLUGIN_ID]
     config = codex_home() / "config.toml"
+    standalone_skill = codex_home() / "skills" / "cross-project-delegation" / "SKILL.md"
     return {
         "plugin_id": PLUGIN_ID,
         "plugin_version": _plugin_version(),
@@ -1004,6 +1005,8 @@ def plugin_health() -> dict[str, Any]:
         "duplicate_enabled_plugin_ids": duplicates,
         "plugin_config_observed": config.is_file(),
         "legacy_learning_source_exists": (codex_home() / "learning").is_dir(),
+        "standalone_cross_project_skill_exists": standalone_skill.is_file(),
+        "standalone_cross_project_skill_path": str(standalone_skill.resolve()) if standalone_skill.is_file() else None,
     }
 
 
