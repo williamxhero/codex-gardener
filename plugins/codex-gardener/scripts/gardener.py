@@ -40,12 +40,15 @@ KNOWLEDGE_SCOPES = {"repository", "global"}
 SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
 DEFERRED_CAPTURE_DIR = "deferred-captures"
 DEFERRED_AUDIT_DIR = "deferred-audits"
+DEFERRED_MAINTENANCE_DIR = "deferred-maintenance"
 AUDIT_CHECKPOINT_SCHEMA_VERSION = 1
 AUDIT_THRESHOLD_ENV = "CODEX_GARDENER_AUDIT_THRESHOLD"
 AUDIT_MAX_DAYS_ENV = "CODEX_GARDENER_AUDIT_MAX_DAYS"
 DEFAULT_AUDIT_THRESHOLD = 10
 DEFAULT_AUDIT_MAX_DAYS = 7
+DEFAULT_MAINTENANCE_BATCH = 3
 SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
+SCHEDULED_MAINTENANCE_MARKER = "[codex-gardener:scheduled-maintenance]"
 AUDIT_REASONS = {"review_threshold", "elapsed_time", "forced", "scheduled"}
 CORRECTION_RE = re.compile(
     r"(?:不对|错了|纠正|我说的是|你忘了|没有按|不是.{0,20}而是|"
@@ -391,6 +394,9 @@ def new_state(payload: dict[str, Any]) -> dict[str, Any]:
         "audit_reason": None,
         "continuation_kind": None,
         "force_audit": False,
+        "force_maintenance": False,
+        "pending_id": None,
+        "maintenance_pending_ids": [],
         "updated_at": utc_now(),
     }
 
@@ -762,6 +768,10 @@ def deferred_audit_dir(repo: Path, session_id: str) -> Path:
     return repo.resolve() / ".codex" / "learning" / DEFERRED_AUDIT_DIR / safe_name(session_id)
 
 
+def deferred_maintenance_dir(repo: Path, session_id: str) -> Path:
+    return repo.resolve() / ".codex" / "learning" / DEFERRED_MAINTENANCE_DIR / safe_name(session_id)
+
+
 def ensure_deferred_audit_dir(repo: Path, session_id: str) -> Path:
     learning = repo.resolve() / ".codex" / "learning"
     directory = deferred_audit_dir(repo, session_id)
@@ -772,6 +782,60 @@ def ensure_deferred_audit_dir(repo: Path, session_id: str) -> Path:
     if ignored not in existing:
         ignore.write_text("\n".join([*existing, ignored]).rstrip() + "\n", encoding="utf-8", newline="\n")
     return directory
+
+
+def ensure_deferred_maintenance_dir(repo: Path, session_id: str) -> Path:
+    learning = repo.resolve() / ".codex" / "learning"
+    directory = deferred_maintenance_dir(repo, session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    ignore = learning / ".gitignore"
+    existing = ignore.read_text(encoding="utf-8").splitlines() if ignore.is_file() else []
+    ignored = f"{DEFERRED_MAINTENANCE_DIR}/"
+    if ignored not in existing:
+        ignore.write_text("\n".join([*existing, ignored]).rstrip() + "\n", encoding="utf-8", newline="\n")
+    return directory
+
+
+def defer_pending_outcome(args: argparse.Namespace) -> dict[str, Any]:
+    repo = Path(args.repo).resolve()
+    maintenance_session_id = str(args.session_id).strip()
+    pending_id = str(args.pending_id).strip().casefold()
+    outcome = str(args.outcome).strip().casefold()
+    if not maintenance_session_id or len(maintenance_session_id) > 256:
+        raise ValueError("session-id must contain 1 to 256 characters")
+    if not re.fullmatch(r"[0-9a-f]{32}", pending_id):
+        raise ValueError("pending-id must be a 32-character lowercase hex identifier")
+    if outcome not in {"candidate", "no-candidate"}:
+        raise ValueError("outcome must be candidate or no-candidate")
+    marker: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "deferred_pending_outcome",
+        "maintenance_session_id": maintenance_session_id,
+        "pending_id": pending_id,
+        "outcome": outcome,
+        "created_at": utc_now(),
+    }
+    if outcome == "candidate":
+        fields = normalized_candidate_fields(args)
+        marker.update(
+            {
+                "fingerprint": candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"]),
+                "knowledge_scope": fields["knowledge_scope"],
+                "scope": fields["scope"],
+                "lesson": fields["lesson"],
+                "evidence_summary": fields["evidence"],
+                "recommended_target": fields["target"],
+                "confidence": fields["confidence"],
+            }
+        )
+    elif any(
+        getattr(args, name, None) is not None
+        for name in ("knowledge_scope", "scope", "lesson", "evidence", "target", "confidence")
+    ):
+        raise ValueError("no-candidate outcomes must not include candidate fields")
+    path = ensure_deferred_maintenance_dir(repo, maintenance_session_id) / f"{pending_id}.json"
+    atomic_write_json(path, marker)
+    return {"deferred": True, "outcome": outcome, "pending_id": pending_id}
 
 
 def defer_audit_completion(args: argparse.Namespace) -> dict[str, Any]:
@@ -970,6 +1034,7 @@ def record_candidate(args: argparse.Namespace) -> dict[str, Any]:
             knowledge_scope=fields["knowledge_scope"],
             recommended_target=fields["target"],
             confidence_bucket=confidence_bucket(fields["confidence"]),
+            run_kind=getattr(args, "run_kind", effectiveness.current_run_kind()),
         )
     return stored
 
@@ -1220,51 +1285,275 @@ def pending_path() -> Path:
     return plugin_data_root() / "pending.jsonl"
 
 
-def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
-    records = read_jsonl(pending_path())
-    resolved = {
+def pending_identity(record: dict[str, Any]) -> str:
+    explicit = str(record.get("pending_id") or "")
+    if re.fullmatch(r"[0-9a-f]{32}", explicit):
+        return explicit
+    session_id = str(record.get("session_id") or "")
+    project = str(record.get("repo_root") or record.get("cwd") or "")
+    created_at = str(record.get("created_at") or "")
+    return sha256_text(f"legacy-pending\0{session_id}\0{project}\0{created_at}")[:32]
+
+
+def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resolved_ids = {
+        str(record.get("pending_id"))
+        for record in records
+        if record.get("record_type") == "resolved" and record.get("pending_id")
+    }
+    legacy_resolved_sessions = {
         str(record.get("session_id"))
         for record in records
-        if record.get("record_type") == "resolved" and record.get("session_id")
+        if record.get("record_type") == "resolved"
+        and not record.get("pending_id")
+        and record.get("session_id")
     }
-    records = [
-        record
-        for record in records
-        if record.get("record_type", "pending") == "pending"
-        and str(record.get("session_id")) not in resolved
-    ]
+    active: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    seen_sources: set[tuple[str, str]] = set()
+    for raw in records:
+        if raw.get("record_type", "pending") != "pending":
+            continue
+        pending_id = pending_identity(raw)
+        session_id = str(raw.get("session_id") or "")
+        source = (
+            session_id,
+            str(raw.get("repo_root") or raw.get("cwd") or "").casefold(),
+        )
+        if (
+            pending_id in resolved_ids
+            or session_id in legacy_resolved_sessions
+            or pending_id in seen
+            or source in seen_sources
+        ):
+            continue
+        record = dict(raw)
+        record["pending_id"] = pending_id
+        active.append(record)
+        seen.add(pending_id)
+        seen_sources.add(source)
+    return active
+
+
+def pending_records(repo: Path | None = None) -> list[dict[str, Any]]:
+    records = active_pending_records(read_jsonl(pending_path()))
     if repo is None:
         return records
     wanted = str(repo.resolve()).casefold()
     return [record for record in records if str(record.get("repo_root") or record.get("cwd") or "").casefold() == wanted]
 
 
-def resolve_pending(session_id: str) -> None:
-    matching = next(
-        (
-            record
-            for record in reversed(read_jsonl(pending_path()))
-            if record.get("record_type", "pending") == "pending"
-            and str(record.get("session_id")) == session_id
-        ),
-        {},
-    )
-    append_jsonl(
-        pending_path(),
-        {
+def maintenance_status(limit: int = DEFAULT_MAINTENANCE_BATCH) -> dict[str, Any]:
+    if not 1 <= limit <= 10:
+        raise ValueError("maintenance batch limit must be between 1 and 10")
+    pending = pending_records()
+    return {
+        "pending_count": len(pending),
+        "batch_limit": limit,
+        "batch": pending[:limit],
+        "audit": audit_status(initialize=True),
+    }
+
+
+def queue_pending_review(state: dict[str, Any], payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")[:256]
+    repo_value = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")[:4096]
+    pending_id = sha256_text(f"pending\0{session_id}\0{repo_value.casefold()}")[:32]
+    transcript_value = str(payload.get("transcript_path") or "")
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": "pending",
+        "pending_id": pending_id,
+        "session_id": session_id,
+        "repo_root": repo_value or None,
+        "transcript_path": transcript_value[:4096] or None,
+        "signals": safe_signal_categories(state),
+        "run_kind": effectiveness.current_run_kind(),
+        "created_at": utc_now(),
+    }
+    path = pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        existing = active_pending_records(read_jsonl(path))
+        matching = next(
+            (
+                item
+                for item in existing
+                if item.get("pending_id") == pending_id
+                or (
+                    str(item.get("session_id") or "") == session_id
+                    and str(item.get("repo_root") or item.get("cwd") or "").casefold() == repo_value.casefold()
+                )
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching, False
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return record, True
+
+
+def resolve_pending_record(record: dict[str, Any]) -> bool:
+    pending_id = pending_identity(record)
+    path = pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path):
+        records = read_jsonl(path)
+        if not any(item.get("pending_id") == pending_id for item in active_pending_records(records)):
+            return False
+        resolved = {
             "schema_version": SCHEMA_VERSION,
             "record_type": "resolved",
-            "session_id": session_id,
+            "pending_id": pending_id,
+            "session_id": str(record.get("session_id") or ""),
             "created_at": utc_now(),
-        },
-    )
-    raw_project = matching.get("repo_root") or matching.get("cwd")
+        }
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(resolved, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    raw_project = record.get("repo_root") or record.get("cwd")
     project = project_identity(Path(str(raw_project))) if raw_project else None
     log_effectiveness(
         "pending_resolved",
-        session=session_identity(session_id),
+        session=session_identity(record.get("session_id")),
         project=project,
     )
+    return True
+
+
+def resolve_pending(session_id: str) -> None:
+    matching = next(
+        (
+            record for record in reversed(pending_records()) if str(record.get("session_id")) == session_id
+        ),
+        None,
+    )
+    if matching is not None:
+        resolve_pending_record(matching)
+
+
+def candidate_args_from_pending_marker(
+    repo: Path,
+    pending: dict[str, Any],
+    marker: dict[str, Any],
+) -> argparse.Namespace:
+    candidate_allowed = {
+        "schema_version",
+        "record_type",
+        "maintenance_session_id",
+        "pending_id",
+        "outcome",
+        "created_at",
+        "fingerprint",
+        "knowledge_scope",
+        "scope",
+        "lesson",
+        "evidence_summary",
+        "recommended_target",
+        "confidence",
+    }
+    if set(marker) != candidate_allowed:
+        raise ValueError("deferred pending candidate fields are invalid")
+    args = argparse.Namespace(
+        repo=str(repo),
+        session_id=str(pending.get("session_id") or ""),
+        knowledge_scope=marker.get("knowledge_scope"),
+        scope=marker.get("scope"),
+        lesson=marker.get("lesson"),
+        evidence=marker.get("evidence_summary"),
+        target=marker.get("recommended_target"),
+        confidence=marker.get("confidence"),
+        run_kind=str(pending.get("run_kind") or effectiveness.current_run_kind()),
+    )
+    fields = normalized_candidate_fields(args)
+    expected = candidate_fingerprint(fields["scope"], fields["lesson"], fields["target"])
+    if marker.get("fingerprint") != expected:
+        raise ValueError("deferred pending candidate fingerprint is invalid")
+    return args
+
+
+def consume_deferred_pending_outcomes(
+    maintenance_repo: Path,
+    maintenance_session_id: str,
+    expected_pending_ids: list[str],
+) -> tuple[int, int]:
+    processed = 0
+    invalid = 0
+    expected = set(expected_pending_ids[:DEFAULT_MAINTENANCE_BATCH])
+    directory = deferred_maintenance_dir(maintenance_repo, maintenance_session_id)
+    for marker_path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+        marker = load_json_file(marker_path, None)
+        common_allowed = {
+            "schema_version",
+            "record_type",
+            "maintenance_session_id",
+            "pending_id",
+            "outcome",
+            "created_at",
+        }
+        if (
+            not isinstance(marker, dict)
+            or marker.get("schema_version") != SCHEMA_VERSION
+            or marker.get("record_type") != "deferred_pending_outcome"
+            or str(marker.get("maintenance_session_id") or "") != maintenance_session_id
+            or str(marker.get("pending_id") or "") not in expected
+            or marker.get("outcome") not in {"candidate", "no-candidate"}
+            or parse_utc(marker.get("created_at")) is None
+        ):
+            invalid += 1
+            continue
+        pending_id = str(marker["pending_id"])
+        pending = next((item for item in pending_records() if item.get("pending_id") == pending_id), None)
+        raw_repo = (pending.get("repo_root") or pending.get("cwd")) if pending else None
+        if pending is None or not raw_repo:
+            invalid += 1
+            continue
+        source_repo = Path(str(raw_repo)).resolve()
+        if not source_repo.is_dir():
+            invalid += 1
+            continue
+        marker_text = "\n".join(
+            str(marker.get(field) or "")
+            for field in ("scope", "lesson", "evidence_summary")
+        ).replace("\\", "/").casefold()
+        sensitive_paths = [str(raw_repo), str(pending.get("transcript_path") or "")]
+        if any(
+            value and value.replace("\\", "/").casefold() in marker_text
+            for value in sensitive_paths
+        ):
+            invalid += 1
+            continue
+        try:
+            if marker["outcome"] == "candidate":
+                args = candidate_args_from_pending_marker(source_repo, pending, marker)
+                record_candidate(args)
+            elif set(marker) != common_allowed:
+                raise ValueError("no-candidate deferred outcome contains candidate fields")
+            resolved = resolve_pending_record(pending)
+        except (OSError, TimeoutError, TypeError, ValueError):
+            invalid += 1
+            continue
+        if not resolved:
+            with contextlib.suppress(FileNotFoundError):
+                marker_path.unlink()
+            continue
+        if marker["outcome"] == "no-candidate":
+            log_effectiveness(
+                "review_completed_no_candidate",
+                session=session_identity(pending.get("session_id")),
+                project=project_identity(source_repo),
+                run_kind=str(pending.get("run_kind") or effectiveness.current_run_kind()),
+            )
+        with contextlib.suppress(FileNotFoundError):
+            marker_path.unlink()
+        processed += 1
+    with contextlib.suppress(OSError):
+        directory.rmdir()
+    return processed, invalid
 
 
 def mark_review_complete(session_id: str) -> None:
@@ -1309,7 +1598,8 @@ def handle_session_start(payload: dict[str, Any]) -> None:
                         "hookEventName": "SessionStart",
                         "additionalContext": (
                             f"Codex Gardener has {count} unreviewed prior session(s) for this repository. "
-                            "Use $codex-gardener:knowledge-curator when retrospective cleanup is appropriate."
+                            "They are queued for the fixed scheduled maintenance task; do not process them during "
+                            "this ordinary task unless the user explicitly asks."
                         ),
                     }
                 }
@@ -1339,6 +1629,9 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "audit_reason": None,
                 "continuation_kind": None,
                 "force_audit": SCHEDULED_AUDIT_MARKER in prompt,
+                "force_maintenance": SCHEDULED_MAINTENANCE_MARKER in prompt,
+                "pending_id": None,
+                "maintenance_pending_ids": [],
             }
         )
     else:
@@ -1346,6 +1639,8 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
             state["correction_signal"] = True
         if SCHEDULED_AUDIT_MARKER in prompt:
             state["force_audit"] = True
+        if SCHEDULED_MAINTENANCE_MARKER in prompt:
+            state["force_maintenance"] = True
     save_state(path, state)
     lookup_root = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
     context, metrics = promoted_context_result(lookup_root, prompt)
@@ -1401,20 +1696,42 @@ def handle_stop(payload: dict[str, Any]) -> None:
         state["audit_completed"] = True
         state["continuation_kind"] = None
         save_state(path, state)
+    capture_processed, capture_invalid = consume_deferred_candidates(repo, session_id)
+    if capture_invalid:
+        log_effectiveness("operation_error", operation="record", category="input")
+    if capture_processed:
+        state["capture_completed"] = True
+        for pending in pending_records():
+            if str(pending.get("session_id") or "") == session_id:
+                resolve_pending_record(pending)
+        save_state(path, state)
     if payload.get("stop_hook_active"):
+        if continuation_kind == "maintenance" or state.get("force_maintenance"):
+            processed, invalid = consume_deferred_pending_outcomes(
+                repo,
+                session_id,
+                [str(value) for value in state.get("maintenance_pending_ids", [])],
+            )
+            if invalid:
+                log_effectiveness("operation_error", operation="record", category="input")
+            if processed:
+                state["continuation_kind"] = None
+                save_state(path, state)
+            emit_json({"continue": True})
+            return
         if continuation_kind == "audit" or (state.get("audit_requested") and not state.get("review_requested")):
             emit_json({"continue": True})
             return
-        processed, invalid = consume_deferred_candidates(repo, session_id)
-        if invalid:
-            log_effectiveness("operation_error", operation="record", category="input")
-        if invalid and not processed and not state.get("capture_completed"):
+        if continuation_kind != "capture":
+            emit_json({"continue": True})
+            return
+        if capture_invalid and not capture_processed and not state.get("capture_completed"):
             emit_json({"continue": True})
             return
         completed_before_stop = bool(state.get("capture_completed"))
         state["capture_completed"] = True
         save_state(path, state)
-        if not completed_before_stop and not processed:
+        if not completed_before_stop and not capture_processed:
             log_effectiveness(
                 "review_completed_no_candidate",
                 session=session_identity(state.get("session_id")),
@@ -1424,40 +1741,73 @@ def handle_stop(payload: dict[str, Any]) -> None:
         return
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
-    if signals and not state.get("review_requested"):
+    if (
+        signals
+        and not state.get("review_requested")
+        and not state.get("capture_completed")
+        and not state.get("force_maintenance")
+    ):
         state["review_requested"] = True
-        state["continuation_kind"] = "capture"
+        pending, created = queue_pending_review(state, payload)
+        state["pending_id"] = pending["pending_id"]
         save_state(path, state)
-        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
-        repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
-        log_effectiveness(
-            "review_requested",
-            session=session_identity(session_id),
-            project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
-            signals=safe_signal_categories(state),
-        )
-        reason = (
-            "Use $codex-gardener:gardener-capture now to review this completed task for reusable knowledge at the right scope. "
-            f"Session ID: {session_id}. Repository: {repository}. Signals: {', '.join(signals)}. "
-            "Record only generalizable lessons with concise evidence; do not copy prompts, tool output, secrets, or credentials. "
-            "Do not modify AGENTS.md, skills, tests, hooks, or docs during capture. "
-            "If nothing is reusable, report that outcome without running a completion command."
-        )
-        emit_json({"decision": "block", "reason": reason})
-        return
+        if created:
+            project = project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None
+            common = {
+                "session": session_identity(session_id),
+                "project": project,
+                "signals": safe_signal_categories(state),
+            }
+            log_effectiveness("review_requested", **common)
+            log_effectiveness("pending_queued", **common)
     if audit_processed:
         save_state(path, state)
         emit_json({"continue": True})
         return
-    status = audit_status(initialize=True)
-    should_audit = bool(state.get("force_audit")) or (
-        effectiveness.current_run_kind() == "real" and bool(status.get("due"))
-    )
+    if state.get("force_maintenance") and not state.get("force_audit"):
+        batch = pending_records()[:DEFAULT_MAINTENANCE_BATCH]
+        if not batch or state.get("continuation_kind") == "maintenance":
+            save_state(path, state)
+            emit_json({"continue": True})
+            return
+        pending_ids = [str(record["pending_id"]) for record in batch]
+        state["maintenance_pending_ids"] = pending_ids
+        state["continuation_kind"] = "maintenance"
+        maintenance_audit = audit_status(initialize=True)
+        audit_due = effectiveness.current_run_kind() == "real" and bool(maintenance_audit.get("due"))
+        if audit_due:
+            state["audit_requested"] = True
+            state["audit_reason"] = str(maintenance_audit.get("reason") or "scheduled")
+            log_effectiveness(
+                "audit_requested",
+                session=session_identity(session_id),
+                project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
+                audit_reason=state["audit_reason"],
+            )
+        save_state(path, state)
+        repository = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")
+        audit_instruction = (
+            "A read-only audit is also due; perform the Skill's audit-only checks and defer its completion. "
+            if audit_due
+            else ""
+        )
+        reason = (
+            "Use $codex-gardener:knowledge-curator now in maintenance-only mode. "
+            f"Maintenance session ID: {session_id}. Maintenance repository: {repository}. "
+            f"Review only these pending IDs (maximum {DEFAULT_MAINTENANCE_BATCH}): {', '.join(pending_ids)}. "
+            "For each ID, write exactly one sandbox-safe deferred pending outcome described by the Skill. "
+            f"{audit_instruction}"
+            "Do not promote or resolve candidate status, and do not edit AGENTS.md, Skills, docs, tests, Hooks, "
+            "configuration, plugin files, or any source repository."
+        )
+        emit_json({"decision": "block", "reason": reason})
+        return
+    should_audit = bool(state.get("force_audit"))
     if state.get("review_requested") or state.get("audit_requested") or not should_audit:
         save_state(path, state)
         emit_json({"continue": True})
         return
-    audit_reason = "forced" if state.get("force_audit") else str(status.get("reason") or "elapsed_time")
+    audit_reason = "forced"
     state["audit_requested"] = True
     state["audit_reason"] = audit_reason
     state["continuation_kind"] = "audit"
@@ -1484,28 +1834,27 @@ def handle_session_end(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
-    audit_completed_without_capture_request = state.get("audit_completed") and not state.get("review_requested")
-    if signals and not state.get("capture_completed") and not audit_completed_without_capture_request:
-        session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
-        append_jsonl(
-            pending_path(),
-            {
-                "schema_version": SCHEMA_VERSION,
-                "record_type": "pending",
-                "session_id": session_id,
-                "cwd": str(cwd),
-                "repo_root": state.get("repo_root"),
-                "transcript_path": payload.get("transcript_path"),
-                "signals": signals,
-                "created_at": utc_now(),
-            },
-        )
-        log_effectiveness(
-            "pending_queued",
-            session=session_identity(session_id),
-            project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
-            signals=safe_signal_categories(state),
-        )
+    continuation_kind = str(state.get("continuation_kind") or "")
+    if (
+        signals
+        and not state.get("capture_completed")
+        and not state.get("force_maintenance")
+        and not state.get("force_audit")
+        and continuation_kind not in {"maintenance", "audit"}
+    ):
+        state["review_requested"] = True
+        pending, created = queue_pending_review(state, payload)
+        state["pending_id"] = pending["pending_id"]
+        if created:
+            session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
+            project = project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None
+            common = {
+                "session": session_identity(session_id),
+                "project": project,
+                "signals": safe_signal_categories(state),
+            }
+            log_effectiveness("review_requested", **common)
+            log_effectiveness("pending_queued", **common)
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
 
@@ -1670,6 +2019,18 @@ def build_parser() -> argparse.ArgumentParser:
     deferred_audit.add_argument("--repo", required=True)
     deferred_audit.add_argument("--session-id", required=True)
 
+    deferred_pending = sub.add_parser("defer-pending-outcome")
+    deferred_pending.add_argument("--repo", required=True)
+    deferred_pending.add_argument("--session-id", required=True)
+    deferred_pending.add_argument("--pending-id", required=True)
+    deferred_pending.add_argument("--outcome", required=True, choices=["candidate", "no-candidate"])
+    deferred_pending.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES))
+    deferred_pending.add_argument("--scope")
+    deferred_pending.add_argument("--lesson")
+    deferred_pending.add_argument("--evidence")
+    deferred_pending.add_argument("--target", choices=sorted(TARGETS))
+    deferred_pending.add_argument("--confidence", type=float)
+
     groups = sub.add_parser("groups")
     groups.add_argument("--repo", required=True)
     groups.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
@@ -1705,6 +2066,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly request first-use checkpoint initialization (also the default for this command).",
     )
 
+    maintenance = sub.add_parser("maintenance-status")
+    maintenance.add_argument("--limit", type=int, default=DEFAULT_MAINTENANCE_BATCH)
+
     return parser
 
 
@@ -1720,6 +2084,8 @@ def main() -> int:
             emit_json(defer_candidate(args))
         elif args.command == "defer-audit-complete":
             emit_json(defer_audit_completion(args))
+        elif args.command == "defer-pending-outcome":
+            emit_json(defer_pending_outcome(args))
         elif args.command == "groups":
             emit_json(
                 {
@@ -1747,6 +2113,8 @@ def main() -> int:
                 sys.stdout.write(format_effectiveness_report(report) + "\n")
         elif args.command == "audit-status":
             emit_json(audit_status(initialize=True))
+        elif args.command == "maintenance-status":
+            emit_json(maintenance_status(args.limit))
         return 0
     except (OSError, ValueError, TimeoutError) as exc:
         sys.stderr.write(f"codex-gardener: {exc}\n")

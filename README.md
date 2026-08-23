@@ -44,9 +44,9 @@ Use `python3` when `python` is unavailable. The installer locates `codex`, valid
 
 | Component | Role |
 | --- | --- |
-| `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, and request at most one retrospective when useful. |
-| `$codex-gardener:gardener-capture` | Classify each lesson and defer concise evidence for the unsandboxed Stop Hook without editing promoted artifacts. |
-| `$codex-gardener:knowledge-curator` | Run read-only quality audits or aggregate both stores, challenge scope and conflicts, and promote only sufficiently supported knowledge. |
+| `gardener.py` lifecycle hooks | Track bounded task signals, retrieve promoted repository and global context, silently queue reviews, and reserve continuations for fixed maintenance tasks. |
+| `$codex-gardener:gardener-capture` | Manually classify a lesson and defer concise evidence for the unsandboxed Stop Hook without editing promoted artifacts. |
+| `$codex-gardener:knowledge-curator` | Process bounded scheduled maintenance, run read-only quality audits, or explicitly curate both stores and promote only sufficiently supported knowledge. |
 | `effectiveness.py` | Append privacy-bounded local events and produce deterministic effectiveness reports without network telemetry. |
 | `project_boundary.py` | Conservatively deny detected writes from one Git repository into another. |
 | `$codex-gardener:cross-project-delegation` | Move authorized implementation into its owning repository and isolate concurrent writers in unique Git worktrees. |
@@ -72,13 +72,15 @@ Both stores contain a `.gitignore` for their JSONL data. Missing `CODEX_HOME` de
 
 Version `0.4.4` makes capture safe under normal `workspace-write` execution. The continued model writes validated `defer-record` markers only under ignored `<repository>/.codex/learning/deferred-captures/`; it never needs model-shell access to plugin data or the global store. The second Stop Hook validates session, schema, allowed fields, scope, target, confidence, and fingerprint, then writes formal repository or global candidates and effectiveness events outside the model sandbox. Repeated Stop delivery is idempotent by fingerprint and session. A no-candidate review runs no model command and is recorded directly by the second Stop Hook. The original `record` and `review-complete` CLI commands remain available for backward-compatible direct use outside restricted model execution.
 
-Version `0.5.0` adds an automatic read-only knowledge-quality audit. It becomes due after either 10 unique completed real reviews or 7 elapsed days since the checkpoint was initialized or last successfully audited, whichever happens first. A qualifying review must contain a `review_requested` event and a terminal `capture_recorded` or `review_completed_no_candidate` event for the same session. Duplicate sessions, incomplete reviews, smoke runs, and pre-0.5 unlabelled events do not count. Capture continuations always take priority over audits.
+Version `0.5.0` added a read-only knowledge-quality audit. It becomes due after either 10 unique completed real reviews or 7 elapsed days since the checkpoint was initialized or last successfully audited, whichever happens first. A qualifying review must contain a `review_requested` event and a terminal `capture_recorded` or `review_completed_no_candidate` event for the same session. Duplicate sessions, incomplete reviews, smoke runs, and pre-0.5 unlabelled events do not count.
 
-When due, Stop requests one `$codex-gardener:knowledge-curator` audit-only continuation. It inspects effectiveness, pending work, repository/global candidate status, conflicts, and staleness without promoting, resolving, or editing knowledge artifacts. The model writes only an ignored `defer-audit-complete` marker under `<repository>/.codex/learning/deferred-audits/`; the unsandboxed second Stop validates it, updates the checkpoint under `PLUGIN_DATA`, and records an `audit_completed` event. A missing or invalid marker never advances the checkpoint and is retried in a later task without looping the current turn.
+The due state remains visible in `audit-status`. Starting with `0.6.0`, count/time deadlines never request a continuation in an ordinary task. A fixed weekly task with the exact scheduled marker can still request one `$codex-gardener:knowledge-curator` audit-only continuation. It writes only an ignored `defer-audit-complete` marker; the unsandboxed second Stop validates it, updates the checkpoint under `PLUGIN_DATA`, and records an `audit_completed` event. A missing or invalid marker never advances the checkpoint.
 
 Version `0.5.1` prevents tools used inside a successfully completed audit continuation from being queued as an unfinished capture at SessionEnd. Smoke audits remain observable but intentionally do not reset the real audit checkpoint or count toward its review threshold.
 
 Version `0.5.2` separates a group's evidence maturity (`evidence_status`) from its effective top-level `status`; the latest `proposed`, `promoted`, or `discarded` resolution now wins without hiding the underlying candidate/confirmed/promotable evidence level. Effectiveness JSON keeps effective counts in `candidate_group_status` and adds parallel evidence counts in `candidate_group_evidence_status`. This version also replaces only the exact legacy standalone cross-project Skill targets in Gardener-owned global index and resolution metadata with the bundled plugin path. Read-only reports normalize those targets in memory, while SessionStart performs the locked, atomic, idempotent persisted migration without changing standalone Skill files or the legacy source store.
+
+Version `0.6.0` makes ordinary task completion silent. Stop never emits `decision: block` for ordinary capture or a count/time audit. When bounded signals exist, it atomically queues one pending review under `PLUGIN_DATA` and returns `{"continue": true}`. SessionEnd never duplicates that record; if a session ends before Stop was delivered, it may create the same idempotent fallback record before removing short-lived state. The queue stores an opaque stable pending ID plus bounded metadata; it never stores prompt or tool output. A fixed task containing the exact `[codex-gardener:scheduled-maintenance]` marker may request one curator continuation only when pending work exists. It reviews at most three items by default and writes ignored `defer-pending-outcome` markers under the maintenance repository. Those markers contain no original repository, transcript, or source-session path. The unsandboxed second Stop maps each opaque ID to trusted plugin data, writes repository or global candidates through existing locked stores, records no-candidate outcomes, and resolves pending work idempotently. Maintenance cannot promote or resolve candidate status or edit formal knowledge artifacts. The v0.4.4 deferred-capture path remains supported for explicit manual capture and legacy in-flight continuations.
 
 ## Local effectiveness audit
 
@@ -104,6 +106,7 @@ python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --json
 python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /path/to/repo --json
 python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo
 python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo --initialize
+python <plugin-root>/scripts/gardener.py maintenance-status
 ```
 
 `audit-status` initializes a missing v0.5 checkpoint so its time deadline begins; `--initialize` is accepted for callers that want to make that first-use intent explicit. Without `--repo`, the effectiveness report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, standalone cross-project Skill detection, data-root source, resolved local data/log paths, log existence, latest event time, audit checkpoint metadata, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. It also reports `audit_requested` and `audit_completed` totals and distributions. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
@@ -119,6 +122,8 @@ CODEX_GARDENER_RUN_KIND=real
 Thresholds must be positive integers; invalid values safely fall back to 10 reviews and 7 days. `CODEX_GARDENER_RUN_KIND` accepts only `real` or `smoke` and otherwise falls back to `real`. Use `smoke` for manual Hook or end-to-end tests so they never advance the real-review counter or real audit checkpoint.
 
 For a fixed weekly automation, include the exact marker `[codex-gardener:scheduled-audit]` in its prompt and tell the first response not to audit directly. The normal Stop Hook then requests the same audit-only curator continuation even when the rolling count/time checkpoint is not due. Near matches do not trigger it. If an initial response already completed the audit and left a valid marker, Stop consumes that marker before considering another audit request.
+
+For a fixed daily or otherwise dedicated maintenance task, include the exact marker `[codex-gardener:scheduled-maintenance]` and tell the first response not to review anything directly. Stop continues only when pending work exists, supplies at most three opaque IDs, and lets the curator create one deferred candidate or no-candidate outcome per ID. `maintenance-status` reports the bounded batch and current audit status. If the review threshold is already due, the same nonempty maintenance continuation may also perform the read-only audit and defer its completion. Do not use either scheduled marker in ordinary prompts.
 
 ## Learning and promotion model
 
@@ -138,7 +143,7 @@ Promoted global keyword matches are available in every project context, includin
 
 ## Usage
 
-Normal use is passive after hook trust. A completed task with useful signals may pause briefly so `$codex-gardener:gardener-capture` can defer a bounded retrospective for the second Stop Hook. You can also invoke either workflow directly:
+Normal use is passive and silent after hook trust. Ordinary tasks never receive a Gardener-generated Stop continuation; useful signals are queued for the fixed maintenance task. Invoke capture manually only when you want an immediate explicit review:
 
 ```text
 Use $codex-gardener:gardener-capture to review this task and record reusable knowledge at the right scope.
@@ -206,7 +211,7 @@ Hooks execute local commands with your Codex permissions. Review them before tru
 - Global retrieval is keyword-based and intentionally bounded; it can miss synonyms and returns at most three combined entries.
 - The write guard cannot understand every shell construct, symlink, worktree, nested repository, or custom mutating tool.
 - Effectiveness metrics show observed behavior, not whether a promoted lesson was objectively correct; low-volume windows can be misleading.
-- Transcript formats are unstable. The plugin stores only a supplied path for optional later inspection and never copies transcript contents into its learning inboxes.
+- Transcript formats are unstable. Pending metadata may keep only a supplied path for optional later inspection; deferred maintenance markers and learning inboxes never copy transcript contents or that path.
 
 ## Development
 

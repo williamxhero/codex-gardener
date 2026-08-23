@@ -8,16 +8,17 @@ Lifecycle hooks receive Codex hook event JSON on standard input. The plugin deri
 
 The plugin may store:
 
-- short-lived task state and a pending-review queue under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`;
+- short-lived task state and a pending-review queue under `PLUGIN_DATA`, `CODEX_GARDENER_DATA`, or `$CODEX_HOME/codex-gardener-data/`; new pending records use an opaque stable ID and bounded signal metadata;
 - repository paths, task/session identifiers, signal names, timestamps, and—when Codex supplies it—a local transcript path, but not transcript contents;
 - repository-scoped candidate summaries, resolutions, and indexes under `<repository>/.codex/learning/`;
 - short-lived, ignored deferred candidate markers under `<repository>/.codex/learning/deferred-captures/` until the second Stop Hook consumes them;
 - short-lived, ignored audit completion markers under `<repository>/.codex/learning/deferred-audits/` until Stop consumes them;
+- short-lived, ignored maintenance outcome markers under `<maintenance-repository>/.codex/learning/deferred-maintenance/` until the second Stop consumes them;
 - global candidate summaries, resolutions, and indexes under `$CODEX_HOME/codex-gardener-global-learning/`;
 - append-only effectiveness events under `<plugin-data>/effectiveness/`;
 - an automatic-audit checkpoint under `<plugin-data>/audit-checkpoint.json`.
 
-Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` JSONL into the v2 global store with migration provenance. It does not delete or rewrite the legacy source. Version `0.5.2` may rewrite only the `target_path` field for two exact historical cross-project delegation Skill targets in the Gardener-owned v2 global index and resolution files; it does not modify the legacy source or either standalone or bundled Skill file. The local effectiveness report may print resolved runtime, log, and standalone Skill paths for diagnosis, but those raw paths are not stored in effectiveness events.
+Version `0.4.0` preserves and copies legacy user-level `$CODEX_HOME/learning/` JSONL into the v2 global store with migration provenance. It does not delete or rewrite the legacy source. Version `0.5.2` may rewrite only the `target_path` field for two exact historical cross-project delegation Skill targets in the Gardener-owned v2 global index and resolution files; it does not modify the legacy source or either standalone or bundled Skill file. The local effectiveness report may print resolved runtime, log, and standalone Skill paths for diagnosis, while `pending` and `maintenance-status` may print trusted pending metadata for local review. Inspect those reports before sharing them; raw paths are not stored in effectiveness events or deferred maintenance markers.
 
 Effectiveness events have a strict field allowlist. They may contain counts, fixed categories, validated `real` or `smoke` run kinds, timestamps, and truncated SHA-256 hashes used to correlate sessions and projects. Audit events contain only a fixed reason, run kind, and hashed session/project identities. They never intentionally contain prompt text, tool input or output, transcript content or paths, file content, secrets, raw repository paths, or raw session/turn IDs. The logger does not record ordinary tool calls. Its active JSONL file rotates at 1 MiB, keeps at most four backups, and removes rotated files older than 90 days. Logging failures fail open and cannot block hooks or CLI operations.
 
@@ -26,6 +27,8 @@ Candidate records contain an explicit knowledge scope, topical scope, concise le
 Deferred markers contain the same concise candidate fields except repository path and project fingerprint. They never contain prompts, transcripts, tool input/output, or caller-supplied target paths. The Stop Hook derives the repository and project fingerprint from trusted session state, validates the marker, writes the formal candidate, and then removes the marker.
 
 Deferred audit markers contain only schema/type, session ID, a random completion ID, validated run kind, and creation time; they contain no audit findings or paths. The checkpoint contains initialization/completion times plus hashed successful-audit session and completion identities, but no prompt, transcript, findings, repository path, or raw session ID. The exact scheduled prompt marker is reduced immediately to a boolean session signal; prompt text is not persisted.
+
+Deferred maintenance markers contain the maintenance session ID, opaque pending ID, outcome type, creation time, and—only for a candidate—the same bounded lesson fields used by capture. They never contain the original task session, repository path, transcript path, prompt, or tool output. The unsandboxed Stop Hook accepts only IDs in the requested bounded batch, maps them to trusted pending data, and derives repository/global destinations itself. The exact maintenance prompt marker is also reduced immediately to a boolean.
 
 The JSONL filenames are listed in a `.gitignore` inside each learning store. They remain local unless you deliberately inspect, copy, sync, or commit them. Promoted repository knowledge may become repository files after review. Promoted global knowledge may become `$CODEX_HOME/AGENTS.md` or a Skill under `$CODEX_HOME/skills/`, but only after the curator proposes the exact change and receives explicit user confirmation.
 

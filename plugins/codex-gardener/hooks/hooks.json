@@ -1,5 +1,5 @@
 {
-  "description": "Collect low-risk task signals and request one bounded knowledge review when useful.",
+  "description": "Collect low-risk task signals, queue reviews silently, and run only explicitly scheduled maintenance continuations.",
   "hooks": {
     "PreToolUse": [
       {

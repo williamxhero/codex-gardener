@@ -89,7 +89,9 @@ class WindowsHookCommandTest(unittest.TestCase):
             self.assertEqual(prompt.returncode, 0, prompt.stderr.decode("utf-8", errors="replace"))
             stop = invoke("Stop", {**base, "stop_hook_active": False})
             self.assertEqual(stop.returncode, 0, stop.stderr.decode("utf-8", errors="replace"))
-            self.assertEqual(json.loads(stop.stdout.decode("utf-8"))["decision"], "block")
+            self.assertEqual(json.loads(stop.stdout.decode("utf-8")), {"continue": True})
+            pending = (root / "plugin-data" / "pending.jsonl").read_text(encoding="utf-8")
+            self.assertIn("user_correction", pending)
 
     @unittest.skipUnless(os.name == "nt", "requires cmd.exe")
     def test_wrapper_preserves_unicode_paths_for_project_boundary(self) -> None:

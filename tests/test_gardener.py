@@ -80,6 +80,30 @@ class GardenerTest(unittest.TestCase):
         gardener.log_effectiveness("review_requested", **common, signals=["workspace_changed"])
         gardener.log_effectiveness("review_completed_no_candidate", **common)
 
+    def queue_pending(self, session_id: str, repo: Path | None = None) -> dict:
+        target = repo or self.root
+        payload = self.payload(
+            session_id=session_id,
+            turn_id=f"turn-{session_id}",
+            cwd=str(target),
+        )
+        self.run_hook("SessionStart", payload)
+        self.run_hook("UserPromptSubmit", payload | {"prompt": "纠正：这个任务需要复盘。"})
+        self.assertEqual(self.run_hook("Stop", payload | {"stop_hook_active": False}), {"continue": True})
+        return next(record for record in gardener.pending_records() if record["session_id"] == session_id)
+
+    def start_maintenance(self, *, session_id: str = "maintenance-session") -> tuple[dict, dict]:
+        payload = self.payload(
+            session_id=session_id,
+            turn_id=f"turn-{session_id}",
+            cwd=str(self.other),
+            prompt="[codex-gardener:scheduled-maintenance]",
+        )
+        self.run_hook("SessionStart", payload)
+        self.run_hook("UserPromptSubmit", payload)
+        requested = self.run_hook("Stop", payload | {"stop_hook_active": False})
+        return payload, requested
+
     def init_git(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "config", "user.email", "gardener@example.test"], check=True)
@@ -230,6 +254,338 @@ class GardenerTest(unittest.TestCase):
         self.run_hook("UserPromptSubmit", near_payload)
         self.assertEqual(self.run_hook("Stop", near_payload | {"stop_hook_active": False}), {"continue": True})
 
+    def test_exact_maintenance_marker_continues_only_with_a_bounded_pending_batch(self) -> None:
+        for index in range(4):
+            payload = self.payload(session_id=f"source-{index}", turn_id=f"source-turn-{index}")
+            self.run_hook("SessionStart", payload)
+            self.run_hook(
+                "UserPromptSubmit",
+                payload | {"prompt": "纠正：保留这个可复用经验。"},
+            )
+            self.assertEqual(self.run_hook("Stop", payload | {"stop_hook_active": False}), {"continue": True})
+        pending = gardener.pending_records()
+        self.assertEqual(len(pending), 4)
+
+        maintenance = self.payload(
+            session_id="maintenance-session",
+            turn_id="maintenance-turn",
+            cwd=str(self.other),
+            prompt="[codex-gardener:scheduled-maintenance]",
+        )
+        self.run_hook("SessionStart", maintenance)
+        self.run_hook("UserPromptSubmit", maintenance)
+        requested = self.run_hook("Stop", maintenance | {"stop_hook_active": False})
+
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn("$codex-gardener:knowledge-curator", requested["reason"])
+        self.assertIn("maintenance-only", requested["reason"])
+        state = gardener.load_json_file(gardener.state_path("maintenance-session"), {})
+        self.assertEqual(state["maintenance_pending_ids"], [item["pending_id"] for item in pending[:3]])
+        self.assertNotIn(pending[3]["pending_id"], requested["reason"])
+
+        empty_payload = self.payload(
+            session_id="near-maintenance",
+            turn_id="near-turn",
+            cwd=str(self.other),
+            prompt="[codex-gardener:scheduled-maintenances]",
+        )
+        self.run_hook("SessionStart", empty_payload)
+        self.run_hook("UserPromptSubmit", empty_payload)
+        self.assertEqual(
+            self.run_hook("Stop", empty_payload | {"stop_hook_active": False}),
+            {"continue": True},
+        )
+
+    def test_maintenance_marker_without_pending_never_continues(self) -> None:
+        maintenance = self.payload(
+            session_id="maintenance-empty",
+            turn_id="maintenance-empty-turn",
+            cwd=str(self.other),
+            prompt="[codex-gardener:scheduled-maintenance]",
+        )
+        self.run_hook("SessionStart", maintenance)
+        self.run_hook("UserPromptSubmit", maintenance)
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": False}),
+            {"continue": True},
+        )
+
+    def test_maintenance_status_returns_a_bounded_batch_and_audit_status(self) -> None:
+        for index in range(4):
+            self.queue_pending(f"maintenance-status-{index}", self.root)
+
+        status = self.run_cli("maintenance-status")
+
+        self.assertEqual(status["pending_count"], 4)
+        self.assertEqual(len(status["batch"]), 3)
+        self.assertEqual(
+            [item["pending_id"] for item in status["batch"]],
+            [item["pending_id"] for item in gardener.pending_records()[:3]],
+        )
+        self.assertIn("due", status["audit"])
+
+    def test_due_audit_is_picked_up_by_the_next_nonempty_maintenance_run(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"maintenance-audit-{index}")
+        pending = self.queue_pending("source-audit-maintenance", self.root)
+        maintenance, requested = self.start_maintenance(session_id="maintenance-with-audit")
+        self.assertEqual(requested["decision"], "block")
+        self.assertIn("read-only audit is also due", requested["reason"])
+
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-with-audit",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "no-candidate",
+        )
+        self.run_cli(
+            "defer-audit-complete",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-with-audit",
+        )
+
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertFalse(self.run_cli("audit-status")["due"])
+
+    def test_maintenance_deferred_repository_candidate_uses_trusted_pending_mapping_once(self) -> None:
+        pending = self.queue_pending("source-repository", self.root)
+        maintenance, requested = self.start_maintenance()
+        self.assertEqual(requested["decision"], "block")
+
+        deferred = self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-session",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "candidate",
+            "--knowledge-scope",
+            "repository",
+            "--scope",
+            "testing",
+            "--lesson",
+            "Run the focused regression before the full suite.",
+            "--evidence",
+            "The focused check isolated the failure before broad validation.",
+            "--target",
+            "test",
+            "--confidence",
+            "0.9",
+        )
+        self.assertEqual(
+            deferred,
+            {"deferred": True, "outcome": "candidate", "pending_id": pending["pending_id"]},
+        )
+        marker_text = next(
+            (self.other / ".codex" / "learning" / "deferred-maintenance").rglob("*.json")
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(str(self.root), marker_text)
+        self.assertNotIn("source-repository", marker_text)
+
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        records = gardener.read_learning_records(self.root, "repository", "inbox.jsonl")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["session_id"], "source-repository")
+        self.assertEqual(gardener.pending_records(), [])
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertEqual(len(gardener.read_learning_records(self.root, "repository", "inbox.jsonl")), 1)
+
+    def test_maintenance_deferred_global_candidate_is_written_only_by_second_stop(self) -> None:
+        pending = self.queue_pending("source-global", self.root)
+        maintenance, _ = self.start_maintenance(session_id="maintenance-global")
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-global",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "candidate",
+            "--knowledge-scope",
+            "global",
+            "--scope",
+            "workflow",
+            "--lesson",
+            "Use isolated Git worktrees for concurrent writers.",
+            "--evidence",
+            "The rule applied across unrelated repositories.",
+            "--target",
+            "skill",
+            "--confidence",
+            "0.95",
+        )
+        self.assertEqual(gardener.read_learning_records(self.root, "global", "inbox.jsonl"), [])
+
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        global_records = gardener.read_learning_records(self.root, "global", "inbox.jsonl")
+        self.assertEqual(len(global_records), 1)
+        self.assertEqual(global_records[0]["session_id"], "source-global")
+        self.assertFalse((self.root / ".codex" / "learning" / "inbox.jsonl").exists())
+
+    def test_maintenance_no_candidate_resolves_pending_and_logs_terminal_once(self) -> None:
+        pending = self.queue_pending("source-empty", self.root)
+        maintenance, _ = self.start_maintenance(session_id="maintenance-empty-outcome")
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-empty-outcome",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "no-candidate",
+        )
+
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertEqual(gardener.pending_records(), [])
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["completed_without_candidate"], 1)
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["completed_without_candidate"], 1)
+
+    def test_invalid_or_mismatched_maintenance_marker_fails_open_and_stays_pending(self) -> None:
+        pending = self.queue_pending("source-invalid", self.root)
+        maintenance, _ = self.start_maintenance(session_id="maintenance-invalid")
+        deferred_dir = (
+            self.other
+            / ".codex"
+            / "learning"
+            / "deferred-maintenance"
+            / gardener.safe_name("maintenance-invalid")
+        )
+        deferred_dir.mkdir(parents=True, exist_ok=True)
+        gardener.atomic_write_json(
+            deferred_dir / "invalid.json",
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "record_type": "deferred_pending_outcome",
+                "maintenance_session_id": "maintenance-invalid",
+                "pending_id": "f" * 32,
+                "outcome": "no-candidate",
+                "created_at": gardener.utc_now(),
+            },
+        )
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-invalid",
+            "--pending-id",
+            pending["pending_id"],
+            "--outcome",
+            "candidate",
+            "--knowledge-scope",
+            "repository",
+            "--scope",
+            "privacy",
+            "--lesson",
+            "Keep maintenance handoffs path-free.",
+            "--evidence",
+            f"Copied from {self.root}",
+            "--target",
+            "docs",
+            "--confidence",
+            "0.9",
+        )
+
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertEqual([item["pending_id"] for item in gardener.pending_records()], [pending["pending_id"]])
+
+    def test_legacy_pending_record_gets_a_stable_id_and_can_be_completed_by_maintenance(self) -> None:
+        legacy = {
+            "schema_version": gardener.SCHEMA_VERSION,
+            "record_type": "pending",
+            "session_id": "legacy-source",
+            "cwd": str(self.root),
+            "repo_root": str(self.root),
+            "transcript_path": "C:/legacy/rollout.jsonl",
+            "signals": ["user correction"],
+            "created_at": "2026-08-01T00:00:00Z",
+        }
+        gardener.append_jsonl(gardener.pending_path(), legacy)
+        first = gardener.pending_records()[0]
+        self.assertRegex(first["pending_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(gardener.pending_records()[0]["pending_id"], first["pending_id"])
+        legacy_state = gardener.new_state(
+            self.payload(session_id="legacy-source", cwd=str(self.root))
+        )
+        legacy_state["correction_signal"] = True
+        queued, created = gardener.queue_pending_review(
+            legacy_state,
+            self.payload(session_id="legacy-source", cwd=str(self.root)),
+        )
+        self.assertFalse(created)
+        self.assertEqual(queued["pending_id"], first["pending_id"])
+
+        maintenance, requested = self.start_maintenance(session_id="maintenance-legacy")
+        self.assertEqual(requested["decision"], "block")
+        self.run_cli(
+            "defer-pending-outcome",
+            "--repo",
+            str(self.other),
+            "--session-id",
+            "maintenance-legacy",
+            "--pending-id",
+            first["pending_id"],
+            "--outcome",
+            "no-candidate",
+        )
+        self.assertEqual(
+            self.run_hook("Stop", maintenance | {"stop_hook_active": True}),
+            {"continue": True},
+        )
+        self.assertEqual(gardener.pending_records(), [])
+
+    def test_pending_queue_is_concurrent_idempotent_and_corrupt_lines_fail_open(self) -> None:
+        gardener.pending_path().parent.mkdir(parents=True, exist_ok=True)
+        gardener.pending_path().write_text("not-json\n", encoding="utf-8")
+        state = gardener.new_state(self.payload())
+        state["edit_signal"] = True
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: gardener.queue_pending_review(state, self.payload()), range(16)))
+
+        self.assertEqual(sum(1 for _, created in results if created), 1)
+        self.assertEqual(len(gardener.pending_records()), 1)
+        lines = gardener.pending_path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "not-json")
+        self.assertEqual(len(lines), 2)
+
     def test_deferred_audit_completion_checkpoints_once_and_resets_schedule(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
         for index in range(10):
@@ -237,6 +593,7 @@ class GardenerTest(unittest.TestCase):
         due_before = self.run_cli("audit-status")
         self.assertTrue(due_before["due"])
         self.assertEqual(due_before["qualifying_reviews"], 10)
+        self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
         requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
         self.assertIn("$codex-gardener:knowledge-curator", requested["reason"])
 
@@ -271,8 +628,8 @@ class GardenerTest(unittest.TestCase):
             self.payload(prompt="纠正：先复盘任务。[codex-gardener:scheduled-audit]"),
         )
         result = self.run_hook("Stop", self.payload(stop_hook_active=False))
-        self.assertIn("$codex-gardener:gardener-capture", result["reason"])
-        self.assertNotIn("knowledge-curator", result["reason"])
+        self.assertEqual(result, {"continue": True})
+        self.assertEqual(len(gardener.pending_records()), 1)
         self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
 
     def test_forced_audit_completion_is_checkpointed_once(self) -> None:
@@ -393,18 +750,19 @@ class GardenerTest(unittest.TestCase):
             self.payload(prompt="纠正：先完成 capture。[codex-gardener:scheduled-audit]"),
         )
         requested = self.run_hook("Stop", self.payload(stop_hook_active=False))
-        self.assertIn("$codex-gardener:gardener-capture", requested["reason"])
+        self.assertEqual(requested, {"continue": True})
         self.run_hook("SessionEnd", self.payload(reason="other"))
 
         pending = gardener.pending_records()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["session_id"], "session-1")
-        self.assertIn("user correction", pending[0]["signals"])
+        self.assertIn("user_correction", pending[0]["signals"])
 
     def test_audit_request_is_one_shot_and_missing_marker_retries_next_session(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
         self.log_completed_review("threshold-review")
         with patch.dict(os.environ, {gardener.AUDIT_THRESHOLD_ENV: "1"}):
+            self.run_hook("UserPromptSubmit", self.payload(prompt="[codex-gardener:scheduled-audit]"))
             first = self.run_hook("Stop", self.payload(stop_hook_active=False))
             self.assertIn("$codex-gardener:knowledge-curator", first["reason"])
             self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
@@ -413,6 +771,7 @@ class GardenerTest(unittest.TestCase):
 
             next_payload = self.payload(session_id="session-2", turn_id="turn-2")
             self.run_hook("SessionStart", next_payload)
+            self.run_hook("UserPromptSubmit", next_payload | {"prompt": "[codex-gardener:scheduled-audit]"})
             retried = self.run_hook("Stop", next_payload | {"stop_hook_active": False})
         self.assertIn("$codex-gardener:knowledge-curator", retried["reason"])
         audits = gardener.effectiveness_report(14, self.root)["audits"]
@@ -525,17 +884,68 @@ class GardenerTest(unittest.TestCase):
         result = self.run_hook("Stop", self.payload(stop_hook_active=False))
         self.assertEqual(result, {"continue": True})
 
+    def test_ordinary_stop_queues_review_without_a_continuation(self) -> None:
+        self.init_git()
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        (self.root / "tracked.txt").write_text("after\n", encoding="utf-8")
+
+        first = self.run_hook("Stop", self.payload(stop_hook_active=False))
+        second = self.run_hook("Stop", self.payload(stop_hook_active=False))
+
+        self.assertEqual(first, {"continue": True})
+        self.assertEqual(second, {"continue": True})
+        pending = gardener.pending_records()
+        self.assertEqual(len(pending), 1)
+        self.assertRegex(pending[0]["pending_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(pending[0]["session_id"], "session-1")
+        self.assertEqual(pending[0]["signals"], ["workspace_changed"])
+
+    def test_session_end_does_not_duplicate_an_immediately_queued_review(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook(
+            "PostToolUse",
+            self.payload(
+                tool_name="apply_patch",
+                tool_input={"patch": "private tool payload"},
+                tool_response={"status": "ok"},
+            ),
+        )
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
+
+        self.run_hook(
+            "SessionEnd",
+            self.payload(reason="other", transcript_path="C:/private/rollout.jsonl"),
+        )
+
+        pending = gardener.pending_records()
+        self.assertEqual(len(pending), 1)
+        rendered = json.dumps(pending)
+        self.assertNotIn("private tool payload", rendered)
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["pending_queued"], 1)
+
+    def test_due_audit_never_interrupts_an_ordinary_task(self) -> None:
+        self.run_cli("audit-status", "--initialize")
+        for index in range(10):
+            self.log_completed_review(f"ordinary-due-{index}")
+        self.run_hook("SessionStart", self.payload(source="startup"))
+
+        result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+
+        self.assertEqual(result, {"continue": True})
+        self.assertTrue(self.run_cli("audit-status")["due"])
+        self.assertEqual(gardener.effectiveness_report(14, self.root)["audits"]["requested"], 0)
+
     def test_edit_triggers_once_and_active_stop_does_not_loop(self) -> None:
         self.init_git()
         self.run_hook("SessionStart", self.payload(source="startup"))
         (self.root / "tracked.txt").write_text("after\n", encoding="utf-8")
         first = self.run_hook("Stop", self.payload(stop_hook_active=False))
-        self.assertEqual(first["decision"], "block")
-        self.assertIn("$codex-gardener:gardener-capture", first["reason"])
+        self.assertEqual(first, {"continue": True})
         second = self.run_hook("Stop", self.payload(stop_hook_active=True))
         self.assertEqual(second, {"continue": True})
         report = gardener.effectiveness_report(14, self.root)
-        self.assertEqual(report["reviews"]["completed_without_candidate"], 1)
+        self.assertEqual(report["reviews"]["completed_without_candidate"], 0)
+        self.assertEqual(report["reviews"]["current_pending"], 1)
 
     def test_correction_and_repeated_failures_trigger(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
@@ -551,9 +961,11 @@ class GardenerTest(unittest.TestCase):
                 ),
             )
         result = self.run_hook("Stop", self.payload(stop_hook_active=False))
-        self.assertEqual(result["decision"], "block")
-        self.assertIn("user correction", result["reason"])
-        self.assertIn("repeated failures", result["reason"])
+        self.assertEqual(result, {"continue": True})
+        self.assertEqual(
+            gardener.pending_records()[0]["signals"],
+            ["user_correction", "repeated_failures", "repeated_tool_workflow"],
+        )
 
     def test_non_git_and_corrupt_state_degrade_safely(self) -> None:
         path = gardener.state_path("session-1")
@@ -588,12 +1000,12 @@ class GardenerTest(unittest.TestCase):
         first_prompt = self.payload(turn_id="turn-1", prompt="不对，我说的是项目入口")
         self.run_hook("UserPromptSubmit", first_prompt)
         first = self.run_hook("Stop", self.payload(turn_id="turn-1", stop_hook_active=False))
-        self.assertEqual(first["decision"], "block")
-        self.run_hook("Stop", self.payload(turn_id="turn-1", stop_hook_active=True))
+        self.assertEqual(first, {"continue": True})
         second_prompt = self.payload(turn_id="turn-2", prompt="wrong, use the documented command")
         self.run_hook("UserPromptSubmit", second_prompt)
         second = self.run_hook("Stop", self.payload(turn_id="turn-2", stop_hook_active=False))
-        self.assertEqual(second["decision"], "block")
+        self.assertEqual(second, {"continue": True})
+        self.assertEqual(len(gardener.pending_records()), 1)
 
     def test_candidates_dedupe_sessions_and_promote_at_three(self) -> None:
         for session in ("s1", "s1", "s2", "s3"):
@@ -615,7 +1027,7 @@ class GardenerTest(unittest.TestCase):
         self.init_git()
         self.run_hook("SessionStart", self.payload(source="startup"))
         self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：使用项目约定的入口"))
-        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
 
         with patch.object(gardener, "state_path", side_effect=AssertionError("defer must stay in workspace")):
             deferred = gardener.defer_candidate(self.candidate_args())
@@ -638,11 +1050,23 @@ class GardenerTest(unittest.TestCase):
         self.assertEqual(len(gardener.read_jsonl(self.root / ".codex" / "learning" / "inbox.jsonl")), 1)
         self.assertEqual(gardener.effectiveness_report(14, self.root)["reviews"]["captures_recorded"], 1)
 
+    def test_normal_stop_consumes_manual_or_legacy_deferred_capture_without_blocking(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        gardener.defer_candidate(self.candidate_args())
+
+        result = self.run_hook("Stop", self.payload(stop_hook_active=False))
+
+        self.assertEqual(result, {"continue": True})
+        records = gardener.read_learning_records(self.root, "repository", "inbox.jsonl")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["session_id"], "session-1")
+        self.assertEqual(gardener.pending_records(), [])
+
     def test_active_stop_commits_deferred_global_candidate_outside_model_process(self) -> None:
         self.init_git()
         self.run_hook("SessionStart", self.payload(source="startup"))
         self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：这是跨项目原则"))
-        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
         args = self.candidate_args(
             knowledge_scope="global",
             lesson="Keep portable capture handoffs independent of repository conventions.",
@@ -710,7 +1134,7 @@ class GardenerTest(unittest.TestCase):
         self.init_git()
         self.run_hook("SessionStart", self.payload(source="startup"))
         self.run_hook("UserPromptSubmit", self.payload(prompt="纠正：检查错误 marker"))
-        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False))["decision"], "block")
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
         directory = gardener.deferred_capture_dir(self.root, "session-1")
         directory.mkdir(parents=True)
         marker = directory / "invalid.json"
@@ -1298,8 +1722,9 @@ class GardenerTest(unittest.TestCase):
         self.run_hook("UserPromptSubmit", self.payload(prompt="Update the parser contract"))
         (self.root / "tracked.txt").write_text("changed\n", encoding="utf-8")
         stop = self.run_hook("Stop", self.payload(stop_hook_active=False))
-        self.assertEqual(stop["decision"], "block")
+        self.assertEqual(stop, {"continue": True})
         gardener.record_candidate(self.candidate_args())
+        gardener.resolve_pending("session-1")
 
         report = gardener.effectiveness_report(14, self.root)
         self.assertEqual(report["coverage"]["sessions_observed"], 1)
@@ -1359,7 +1784,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.5.2")
+        self.assertEqual(report["health"]["plugin_version"], "0.6.0")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 
@@ -1407,6 +1832,7 @@ class GardenerTest(unittest.TestCase):
                 tool_response={"status": "ok"},
             ),
         )
+        self.run_hook("Stop", second | {"stop_hook_active": False})
         self.run_hook("SessionEnd", second)
         report = gardener.effectiveness_report(14, self.root)
         self.assertEqual(report["reviews"]["pending_queued"], 1)

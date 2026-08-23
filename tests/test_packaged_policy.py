@@ -10,11 +10,11 @@ PLUGIN = ROOT / "plugins" / "codex-gardener"
 
 
 class PackagedPolicyTest(unittest.TestCase):
-    def test_manifest_version_is_0_5_2(self) -> None:
+    def test_manifest_version_is_0_6_0(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.5.2")
+        self.assertEqual(manifest["version"], "0.6.0")
 
     def test_delegation_skill_requires_isolated_concurrent_writers(self) -> None:
         skill = (
@@ -42,6 +42,7 @@ class PackagedPolicyTest(unittest.TestCase):
         self.assertNotIn("review-complete", skill)
         self.assertIn("do not run a command", skill.casefold())
         self.assertIn("defer-record", skill)
+        self.assertIn("ordinary tasks do not invoke this skill automatically", skill.casefold())
 
     def test_curator_skill_defines_read_only_automatic_audit_mode(self) -> None:
         skill = (PLUGIN / "skills" / "knowledge-curator" / "SKILL.md").read_text(encoding="utf-8").casefold()
@@ -56,6 +57,21 @@ class PackagedPolicyTest(unittest.TestCase):
             "repository and global",
             "conflict",
             "stale",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, skill)
+
+    def test_curator_skill_defines_bounded_non_promoting_maintenance(self) -> None:
+        skill = (PLUGIN / "skills" / "knowledge-curator" / "SKILL.md").read_text(encoding="utf-8").casefold()
+        for phrase in (
+            "maintenance-only",
+            "at most three",
+            "defer-pending-outcome",
+            "no-candidate",
+            "write exactly one outcome",
+            "must not promote",
+            "must not edit agents.md",
+            "marker contains no original session, repository, or transcript path",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)

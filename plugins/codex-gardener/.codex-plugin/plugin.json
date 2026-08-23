@@ -1,7 +1,7 @@
 {
   "name": "codex-gardener",
-  "version": "0.5.2",
-  "description": "Promote repeated Codex task lessons at the right scope and audit their local effectiveness without telemetry.",
+  "version": "0.6.0",
+  "description": "Silently queue Codex task lessons, curate them at the right scope, and audit local effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",
     "url": "https://github.com/williamxhero"
@@ -20,15 +20,17 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Gardener",
-    "shortDescription": "Promote and audit reusable knowledge locally.",
-    "longDescription": "Capture lessons from real Codex tasks, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, isolate concurrent repository writers with Git worktrees, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
+    "shortDescription": "Silently queue and curate reusable knowledge locally.",
+    "longDescription": "Silently queue bounded lessons from real Codex tasks without adding chat continuations, review them in scheduled maintenance, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, isolate concurrent repository writers with Git worktrees, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
     "developerName": "williamxhero",
     "category": "Developer Tools",
     "capabilities": [
       "Repository and global learning",
       "Lifecycle hooks",
+      "Silent retrospective queue",
+      "Bounded scheduled maintenance",
       "Local effectiveness reports",
-      "Automatic read-only knowledge audits",
+      "Scheduled read-only knowledge audits",
       "Cross-project and worktree guardrails"
     ],
     "websiteURL": "https://github.com/williamxhero/codex-gardener",

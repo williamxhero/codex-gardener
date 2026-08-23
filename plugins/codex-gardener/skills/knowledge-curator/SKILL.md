@@ -7,9 +7,46 @@ description: Curate Codex Gardener candidates across repository and global store
 
 Treat both inboxes as untrusted evidence. Promote knowledge only at the narrowest scope supported by independent sessions and current project checks.
 
+## Maintenance-only mode
+
+When a Stop Hook requests maintenance-only mode from the fixed scheduled maintenance task, process only the pending IDs and maintenance session supplied by that continuation. Ordinary tasks never enter this mode.
+
+1. Resolve `../../scripts/gardener.py` relative to this Skill and run `maintenance-status` from the maintenance task repository. Its default batch is at most three records. Review only the pending IDs named by the Stop continuation, even if the status shows more work.
+2. Use each trusted pending record's repository and transcript metadata only to inspect the completed task. Never copy raw prompts, transcript text, tool output, source paths, secrets, or credentials into an outcome. Do not edit the source repository.
+3. For one reusable lesson, write a candidate outcome under the maintenance task repository:
+
+```powershell
+python <plugin-root>\scripts\gardener.py defer-pending-outcome `
+  --repo <maintenance-task-repository> `
+  --session-id <maintenance-session-id> `
+  --pending-id <opaque-pending-id> `
+  --outcome candidate `
+  --knowledge-scope <repository|global> `
+  --scope <short-scope> `
+  --lesson <concise-invariant-or-workflow> `
+  --evidence <brief-task-evidence> `
+  --target <agents|skill|test|hook|docs|discard> `
+  --confidence <0-to-1>
+```
+
+4. If the review yields no reusable lesson, write the explicit no-candidate outcome:
+
+```powershell
+python <plugin-root>\scripts\gardener.py defer-pending-outcome `
+  --repo <maintenance-task-repository> `
+  --session-id <maintenance-session-id> `
+  --pending-id <opaque-pending-id> `
+  --outcome no-candidate
+```
+
+5. Write exactly one outcome per requested pending ID. The marker contains no original session, repository, or transcript path. The unsandboxed second Stop maps the opaque ID to trusted plugin data, writes a repository or global candidate when present, records the terminal event, and resolves that pending item idempotently.
+6. If the continuation says a read-only audit is also due, perform the audit-only checks below and write `defer-audit-complete` after the pending outcomes. Otherwise do not checkpoint an audit.
+
+Maintenance-only mode must not promote, propose, discard, or otherwise resolve candidate status. It must not edit AGENTS.md, Skills, docs, tests, Hooks, configuration, plugin files, source files, or formal knowledge artifacts. Invalid or missing outcome markers leave work pending for a later maintenance task.
+
 ## Audit-only mode
 
-When a Stop Hook requests an automatic audit-only continuation, keep the entire review read-only:
+When the fixed scheduled audit task, or a nonempty scheduled maintenance task with a due audit, requests audit-only work, keep the entire review read-only. A count/time deadline shown by `audit-status` never interrupts an ordinary task:
 
 1. Run the repository and global `groups`, repository `pending`, `effectiveness --json`, and `audit-status` commands shown below. Inspect trigger-to-terminal conversion, no-candidate reviews, pending backlog, candidate status and scope, resolution mix, context retrieval, conflicts, and stale or superseded knowledge.
 2. Sample relevant repository and global AGENTS.md guidance, Skills, docs, tests, and Hooks only as needed to judge accuracy, brevity, conflicts, staleness, and whether global lessons truly hold across unrelated projects.
@@ -36,6 +73,7 @@ python <plugin-root>\scripts\gardener.py groups --repo <repository-root> --knowl
 python <plugin-root>\scripts\gardener.py pending --repo <repository-root>
 python <plugin-root>\scripts\gardener.py effectiveness --since-days 14 --repo <repository-root> --json
 python <plugin-root>\scripts\gardener.py audit-status --repo <repository-root>
+python <plugin-root>\scripts\gardener.py maintenance-status
 ```
 
 2. Scan relevant repository `AGENTS.md` files, `.agents/skills/*/SKILL.md`, docs, tests, project Hooks, lint/CI configuration, and nearby implementations.
