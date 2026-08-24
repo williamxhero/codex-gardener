@@ -10,11 +10,11 @@ PLUGIN = ROOT / "plugins" / "codex-gardener"
 
 
 class PackagedPolicyTest(unittest.TestCase):
-    def test_manifest_version_is_0_6_1(self) -> None:
+    def test_manifest_version_is_0_7_0(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(manifest["version"], "0.6.1")
+        self.assertEqual(manifest["version"], "0.7.0")
 
     def test_stop_timeout_covers_bounded_maintenance_processing(self) -> None:
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]

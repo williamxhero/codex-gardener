@@ -68,7 +68,7 @@ def validate_manifest() -> None:
     data = load_json(path)
     require(data.get("name") == "codex-gardener", "Plugin name is invalid")
     require(bool(VERSION_RE.fullmatch(str(data.get("version", "")))), "Plugin version must be strict x.y.z semver")
-    require(data.get("version") == "0.6.1", "Plugin version must be 0.6.1")
+    require(data.get("version") == "0.7.0", "Plugin version must be 0.7.0")
     require(isinstance(data.get("description"), str) and len(data["description"]) >= 20, "Plugin description is too short")
     require("right scope" in data["description"], "Plugin description must explain scope-aware promotion")
     require(data.get("author", {}).get("name") == "williamxhero", "Plugin author is invalid")
@@ -105,6 +105,7 @@ def validate_hooks() -> None:
     for script in ("gardener.py", "project_boundary.py"):
         require(script in rendered and (PLUGIN / "scripts" / script).is_file(), f"Hook script is missing: {script}")
     require((PLUGIN / "scripts" / "effectiveness.py").is_file(), "Effectiveness logger is missing")
+    require((PLUGIN / "scripts" / "retrieval.py").is_file(), "Derived retrieval indexer is missing")
     require((PLUGIN / "scripts" / "codex-gardener-hook.cmd").is_file(), "Windows Hook wrapper is missing")
 
 
@@ -171,6 +172,10 @@ def validate_hygiene() -> None:
         "Sandbox-safe deferred maintenance outcome CLI is missing",
     )
     require('sub.add_parser("maintenance-status")' in gardener_source, "Bounded maintenance status CLI is missing")
+    for command in ("index-status", "index-rebuild", "index-audit"):
+        require(f'sub.add_parser("{command}")' in gardener_source, f"Retrieval {command} CLI is missing")
+    require("additionalContextLimit" in gardener_source, "UserPromptSubmit retrieval context must be bounded")
+    require("sqlite3" in (PLUGIN / "scripts" / "retrieval.py").read_text(encoding="utf-8"), "Retrieval must use stdlib sqlite3")
     require("SCHEDULED_MAINTENANCE_MARKER" in gardener_source, "Scheduled maintenance marker is missing")
     require("SCHEDULED_AUDIT_CHECK_MARKER" in gardener_source, "Conditional audit marker is missing")
     require("CODEX_GARDENER_AUDIT_THRESHOLD" in gardener_source, "Knowledge audit review threshold is missing")

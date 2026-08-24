@@ -1,7 +1,7 @@
 {
   "name": "codex-gardener",
-  "version": "0.6.1",
-  "description": "Silently queue Codex task lessons, curate them at the right scope, and audit local effectiveness without telemetry.",
+  "version": "0.7.0",
+  "description": "Silently queue Codex task lessons, curate them at the right scope, retrieve promoted guidance locally, and audit effectiveness without telemetry.",
   "author": {
     "name": "williamxhero",
     "url": "https://github.com/williamxhero"
@@ -20,8 +20,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Gardener",
-    "shortDescription": "Silently queue and curate reusable knowledge locally.",
-    "longDescription": "Silently queue bounded lessons from real Codex tasks without adding chat continuations, review them in scheduled maintenance, distinguish repository-specific knowledge from portable global knowledge, safely promote proven guidance, isolate concurrent repository writers with Git worktrees, and audit low-sensitivity effectiveness metrics entirely on the local machine.",
+    "shortDescription": "Silently queue, retrieve, and curate reusable knowledge locally.",
+    "longDescription": "Silently queue bounded lessons from real Codex tasks without adding chat continuations, retrieve relevant promoted repository and global guidance from a local derived SQLite index, review candidates in scheduled maintenance, and audit privacy-bounded effectiveness locally.",
     "developerName": "williamxhero",
     "category": "Developer Tools",
     "capabilities": [
@@ -30,6 +30,7 @@
       "Silent retrospective queue",
       "Bounded scheduled maintenance",
       "Local effectiveness reports",
+      "Local SQLite retrieval index",
       "Scheduled read-only knowledge audits",
       "Cross-project and worktree guardrails"
     ],

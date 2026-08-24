@@ -25,6 +25,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import effectiveness
+import retrieval
 
 
 SCHEMA_VERSION = 2
@@ -37,7 +38,8 @@ LEGACY_DELEGATION_SKILL_TARGETS = {
 }
 TARGETS = {"agents", "skill", "test", "hook", "docs", "discard"}
 KNOWLEDGE_SCOPES = {"repository", "global"}
-SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed"}
+SAFE_RESOLUTION_STATUSES = {"promoted", "discarded", "proposed", "retired"}
+RETIRE_REASONS = {"stale", "duplicate", "superseded"}
 DEFERRED_CAPTURE_DIR = "deferred-captures"
 DEFERRED_AUDIT_DIR = "deferred-audits"
 DEFERRED_MAINTENANCE_DIR = "deferred-maintenance"
@@ -1209,17 +1211,19 @@ def update_index(repo: Path, resolution: dict[str, Any], knowledge_scope: str = 
     path = root / "index.jsonl"
     entries = read_jsonl(path)
     entries = [item for item in entries if item.get("fingerprint") != resolution["fingerprint"]]
-    entries.append(
-        {
+    if resolution["status"] == "promoted" and resolution["summary"] and resolution["target_path"]:
+        entries.append(
+            {
             "schema_version": SCHEMA_VERSION,
             "fingerprint": resolution["fingerprint"],
             "knowledge_scope": knowledge_scope,
             "summary": resolution["summary"],
             "keywords": resolution["keywords"],
             "target_path": resolution["target_path"],
-            "promoted_at": resolution["created_at"],
-        }
-    )
+                "promoted_at": resolution["created_at"],
+                **resolution["metadata"],
+            }
+        )
     with file_lock(path):
         temp = path.with_name(path.name + ".tmp")
         temp.write_text(
@@ -1228,6 +1232,8 @@ def update_index(repo: Path, resolution: dict[str, Any], knowledge_scope: str = 
             newline="\n",
         )
         os.replace(temp, path)
+    # JSONL is committed first. The derived index is rebuilt only afterwards.
+    retrieval.sync_scope(root)
 
 
 def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
@@ -1235,61 +1241,91 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"status must be one of: {', '.join(sorted(SAFE_RESOLUTION_STATUSES))}")
     repo = Path(args.repo).resolve()
     knowledge_scope = normalize_knowledge_scope(getattr(args, "knowledge_scope", "repository"))
+    status = args.status
+    reason = getattr(args, "reason", None)
+    if status == "retired" and reason not in RETIRE_REASONS:
+        raise ValueError("retired resolutions require --reason stale, duplicate, or superseded")
+    metadata = retrieval.validate_metadata(
+        {
+            "summary": args.summary or "",
+            "task_types": getattr(args, "task_type", None) or [],
+            "path_globs": getattr(args, "path_glob", None) or [],
+            "languages": getattr(args, "language", None) or [],
+            "tools": getattr(args, "tool", None) or [],
+            "platforms": getattr(args, "platform", None) or [],
+            "negative_keywords": getattr(args, "negative_keyword", None) or [],
+            "min_score": getattr(args, "min_score", retrieval.DEFAULT_MIN_SCORE),
+            "supersedes": getattr(args, "supersedes", None),
+        }
+    )
     resolution = {
         "schema_version": SCHEMA_VERSION,
         "fingerprint": args.fingerprint,
         "knowledge_scope": knowledge_scope,
-        "status": args.status,
+        "status": status,
         "summary": (args.summary or "").strip(),
         "keywords": sorted(set(args.keyword or [])),
         "target_path": (args.target_path or "").strip(),
         "created_at": utc_now(),
+        "reason": reason,
+        "metadata": metadata,
     }
     append_jsonl(ensure_learning_dir(repo, knowledge_scope) / "resolutions.jsonl", resolution)
-    if args.status == "promoted" and resolution["summary"] and resolution["target_path"]:
+    if args.status in {"promoted", "retired"}:
         update_index(repo, resolution, knowledge_scope)
     log_effectiveness(
         "resolution_recorded",
         project=project_identity(repo),
         knowledge_scope=knowledge_scope,
-        status=args.status,
+        status=status,
         target=target_category(resolution["target_path"]),
     )
     return resolution
 
 
-def promoted_context_result(repo: Path, prompt: str) -> tuple[str | None, dict[str, int]]:
-    combined: dict[str, dict[str, Any]] = {}
+def promoted_context_result(repo: Path, prompt: str, state: dict[str, Any] | None = None) -> tuple[str | None, dict[str, Any]]:
+    tool_names = list((state or {}).get("tool_names", []))[:16]
+    task_context = retrieval.derive_task_context(prompt, repo, tool_names=tool_names)
+    combined: dict[str, tuple[str, dict[str, Any]]] = {}
+    aggregate: dict[str, Any] = {"eligible": 0, "scored": 0, "filtered": 0, "threshold": 0, "token": 0,
+                                 "latency_ms": 0, "rebuild": 0, "degraded": False}
     available = {"repository": 0, "global": 0}
     for knowledge_scope in ("global", "repository"):
-        for raw_entry in read_learning_records(repo, knowledge_scope, "index.jsonl"):
-            entry = dict(raw_entry)
-            entry["knowledge_scope"] = stored_knowledge_scope(entry.get("knowledge_scope"))
-            fingerprint = str(entry.get("fingerprint") or "")
-            if fingerprint:
-                available[knowledge_scope] += 1
-                combined[fingerprint] = entry
-    entries = list(combined.values())
-    lowered = prompt.casefold()
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for entry in entries:
-        keywords = [str(item).casefold() for item in entry.get("keywords", []) if str(item).strip()]
-        score = sum(1 for keyword in keywords if keyword in lowered)
-        if score:
-            scored.append((score, entry))
-    if not scored:
-        return None, {
-            "repository_available": available["repository"],
-            "global_available": available["global"],
-            "repository_hits": 0,
-            "global_hits": 0,
-            "injected": 0,
-        }
-    scored.sort(key=lambda pair: (-pair[0], str(pair[1].get("promoted_at") or "")), reverse=False)
-    selected = scored[:3]
+        root = learning_dir(repo, knowledge_scope)
+        # A missing derived file is the normal migration case. Rebuild it from
+        # authoritative JSONL; an existing stale/corrupt file still fails open.
+        if (root / "index.jsonl").is_file() and not retrieval.database_path(root).is_file():
+            try:
+                retrieval.sync_scope(root)
+                aggregate["rebuild"] += 1
+            except retrieval.RetrievalError:
+                log_effectiveness("operation_error", operation="retrieval", category="storage")
+        entries, metrics = retrieval.retrieve(root, prompt, task_context=task_context, error_logger=lambda _: log_effectiveness("operation_error", operation="retrieval", category="runtime"))
+        status = retrieval.index_status(root)
+        available[knowledge_scope] = int(status.get("entries") or 0)
+        for key in aggregate:
+            if key == "degraded":
+                aggregate[key] = bool(aggregate[key] or metrics.get(key))
+            else:
+                aggregate[key] += int(metrics.get(key) or 0)
+        for entry in entries:
+            entry["knowledge_scope"] = knowledge_scope
+            summary_key = retrieval.normalized_summary(entry.get("summary"))
+            if knowledge_scope == "repository":
+                for key, (_, current) in list(combined.items()):
+                    if key == summary_key or current.get("fingerprint") == entry.get("fingerprint"):
+                        combined.pop(key)
+            combined[summary_key] = (knowledge_scope, entry)
+    selected = [value[1] for value in combined.values()]
+    selected.sort(key=lambda entry: (-float(entry.get("score") or 0), 0 if entry.get("knowledge_scope") == "repository" else 1,
+                                     str(entry.get("promoted_at") or ""), str(entry.get("fingerprint") or "")))
+    selected = selected[:retrieval.MAX_RESULTS]
+    if not selected:
+        return None, {"repository_available": available["repository"], "global_available": available["global"],
+                      "repository_hits": 0, "global_hits": 0, "injected": 0, **aggregate}
     lines = ["Codex Gardener found relevant promoted knowledge:"]
     hits = {"repository": 0, "global": 0}
-    for _, entry in selected:
+    for entry in selected:
         hits[str(entry["knowledge_scope"])] += 1
         lines.append(
             f"- [{entry.get('knowledge_scope')}] {entry.get('summary')} "
@@ -1300,7 +1336,7 @@ def promoted_context_result(repo: Path, prompt: str) -> tuple[str | None, dict[s
         "global_available": available["global"],
         "repository_hits": hits["repository"],
         "global_hits": hits["global"],
-        "injected": len(selected),
+        "injected": len(selected), **aggregate,
     }
 
 
@@ -1765,6 +1801,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "repeated_tool_signal": False,
                 "test_signal": False,
                 "tool_counts": {},
+                "tool_names": [],
                 "review_requested": False,
                 "capture_completed": False,
                 "audit_requested": False,
@@ -1789,7 +1826,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
             state["force_maintenance"] = True
     save_state(path, state)
     lookup_root = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
-    context, metrics = promoted_context_result(lookup_root, prompt)
+    context, metrics = promoted_context_result(lookup_root, prompt, state)
     log_effectiveness(
         "context_lookup",
         session=session_identity(state.get("session_id")),
@@ -1802,6 +1839,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": context,
+                    "additionalContextLimit": 600,
                 }
             }
         )
@@ -1813,6 +1851,10 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
     tool_input = payload.get("tool_input")
     fingerprint = sha256_text(name.casefold() + "\0" + json_dump(tool_input))[:24]
     counts = state.setdefault("tool_counts", {})
+    tool_names = state.setdefault("tool_names", [])
+    normalized_name = name.casefold()
+    if normalized_name not in tool_names and len(tool_names) < 16:
+        tool_names.append(normalized_name)
     counts[fingerprint] = int(counts.get(fingerprint) or 0) + 1
     if name.casefold() not in {"wait", "write_stdin", "functions.wait"} and counts[fingerprint] >= 2:
         state["repeated_tool_signal"] = True
@@ -1998,6 +2040,10 @@ def handle_stop(payload: dict[str, Any]) -> None:
 
 def handle_session_end(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
+    root_value = state.get("repo_root") or state.get("cwd")
+    if root_value:
+        for knowledge_scope in ("repository", "global"):
+            retrieval.cleanup_session(learning_dir(Path(str(root_value)), knowledge_scope))
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
     continuation_kind = str(state.get("continuation_kind") or "")
@@ -2064,6 +2110,10 @@ def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict
             group_evidence_status[knowledge_scope] = dict(sorted(evidence_counts.items()))
         report["candidate_group_status"] = group_status
         report["candidate_group_evidence_status"] = group_evidence_status
+        report["retrieval_audit"] = {
+            knowledge_scope: retrieval.audit_scope(learning_dir(repo, knowledge_scope)).get("counts", {})
+            for knowledge_scope in ("repository", "global")
+        }
     return report
 
 
@@ -2142,7 +2192,10 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
             "Context: "
             f"{context['lookups_with_hits']}/{context['lookups']} lookups hit "
             f"({context['lookup_hit_rate']:.2%}); {context['hits_repository']} repository and "
-            f"{context['hits_global']} global entries injected"
+            f"{context['hits_global']} global entries injected; eligible={context.get('eligible', 0)} "
+            f"scored={context.get('scored', 0)} filtered={context.get('filtered', 0)} "
+            f"threshold={context.get('threshold', 0)} token={context.get('token', 0)} "
+            f"latency_ms={context.get('latency_ms', 0)} degraded={context.get('degraded', 0)}"
         ),
         f"Boundary denials: {boundary['denials']}",
         (
@@ -2160,6 +2213,7 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
             "Candidate evidence maturity: "
             + json.dumps(report["candidate_group_evidence_status"], sort_keys=True)
         )
+        lines.append("Retrieval audit: " + json.dumps(report.get("retrieval_audit", {}), sort_keys=True))
     return "\n".join(lines)
 
 
@@ -2214,6 +2268,27 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--summary")
     resolve.add_argument("--target-path")
     resolve.add_argument("--keyword", action="append")
+    resolve.add_argument("--task-type", action="append")
+    resolve.add_argument("--path-glob", action="append")
+    resolve.add_argument("--language", action="append")
+    resolve.add_argument("--tool", action="append")
+    resolve.add_argument("--platform", action="append")
+    resolve.add_argument("--negative-keyword", action="append")
+    resolve.add_argument("--min-score", type=float, default=retrieval.DEFAULT_MIN_SCORE)
+    resolve.add_argument("--supersedes")
+    resolve.add_argument("--reason", choices=sorted(RETIRE_REASONS))
+
+    index_status_command = sub.add_parser("index-status")
+    index_status_command.add_argument("--repo", required=True)
+    index_status_command.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
+
+    index_rebuild = sub.add_parser("index-rebuild")
+    index_rebuild.add_argument("--repo", required=True)
+    index_rebuild.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
+
+    index_audit = sub.add_parser("index-audit")
+    index_audit.add_argument("--repo", required=True)
+    index_audit.add_argument("--knowledge-scope", choices=sorted(KNOWLEDGE_SCOPES), default="repository")
 
     review = sub.add_parser("review-complete")
     review.add_argument("--session-id", required=True)
@@ -2267,6 +2342,12 @@ def main() -> int:
             )
         elif args.command == "resolve":
             emit_json(resolve_candidate(args))
+        elif args.command == "index-status":
+            emit_json(retrieval.index_status(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
+        elif args.command == "index-rebuild":
+            emit_json(retrieval.sync_scope(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
+        elif args.command == "index-audit":
+            emit_json(retrieval.audit_scope(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
         elif args.command == "review-complete":
             complete_review_without_candidate(args.session_id)
             emit_json({"completed": True, "session_id": args.session_id})

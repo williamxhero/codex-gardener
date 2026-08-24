@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -46,6 +47,13 @@ class FakeRunner:
 
 
 class InstallTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.env = patch.dict("os.environ", {"CODEX_HOME": str(Path(self.temp.name) / "codex-home")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
     def run_main(self, runner: FakeRunner, argv=None, which=lambda _: "codex"):
         output = io.StringIO()
         error = io.StringIO()
@@ -79,6 +87,8 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(len(runner.commands), 4)
         self.assertEqual(runner.commands[2][1:4], ["plugin", "marketplace", "add"])
         self.assertEqual(runner.commands[3][1:], ["plugin", "add", "codex-gardener@codex-gardener"])
+        self.assertIn("Rebuilt local global retrieval index (0 entries)", output)
+        self.assertTrue((Path(os.environ["CODEX_HOME"]) / "codex-gardener-global-learning" / "retrieval.sqlite3").is_file())
         self.assertIn("run /hooks", output)
         self.assertIn("new task", output)
 

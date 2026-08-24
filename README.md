@@ -84,6 +84,8 @@ Version `0.6.0` makes ordinary task completion silent. Stop never emits `decisio
 
 Version `0.6.1` closes conditional audit scheduling without bringing continuations back to ordinary tasks. A fixed task containing `[codex-gardener:scheduled-audit-check]` requests an audit-only continuation only when `audit-status` is due after 10 qualifying real reviews or 7 elapsed days. When it is not due, Stop returns `{"continue": true}`. The unconditional `[codex-gardener:scheduled-audit]` marker remains available. In a combined maintenance and audit-check task, a due audit runs before pending maintenance so a sustained backlog cannot starve the audit; after a successful audit checkpoint, the next scheduled run resumes maintenance.
 
+Version `0.7.0` keeps `index.jsonl` authoritative and adds a derived, standard-library SQLite retrieval index. It uses NFKC/casefold identifier and CJK tokenization, BM25 (`k1=1.2`, `b=.75`), bounded metadata boosts, and hard scope/negative/path filters. Retrieval is capped at three complete entries and 500 estimated tokens; repository guidance wins global guidance for the same normalized summary. Prompts, tool output, query terms, embeddings, and network access are never persisted or used. Corrupt, locked, or stale derived indexes fail open, emit only an anonymous retrieval error metric, and never fall back to unbounded JSON scanning.
+
 ## Local effectiveness audit
 
 Version `0.3.0` adds a modest append-only JSONL audit under the existing plugin data root:
@@ -109,6 +111,9 @@ python <plugin-root>/scripts/gardener.py effectiveness --since-days 14 --repo /p
 python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo
 python <plugin-root>/scripts/gardener.py audit-status --repo /path/to/repo --initialize
 python <plugin-root>/scripts/gardener.py maintenance-status
+python <plugin-root>/scripts/gardener.py index-status --repo /path/to/repo
+python <plugin-root>/scripts/gardener.py index-rebuild --repo /path/to/repo
+python <plugin-root>/scripts/gardener.py index-audit --repo /path/to/repo
 ```
 
 `audit-status` initializes a missing v0.5 checkpoint so its time deadline begins; `--initialize` is accepted for callers that want to make that first-use intent explicit. Without `--repo`, the effectiveness report remains useful across all observed projects. Supplying a repository additionally reports its current pending count and repository/global candidate-group status counts. JSON includes a `health` block with the plugin ID/version, enabled Gardener plugin IDs, duplicate legacy IDs, standalone cross-project Skill detection, data-root source, resolved local data/log paths, log existence, latest event time, audit checkpoint metadata, and an explicit `observed`, `not_observed`, `unreadable`, or `logging_disabled` status. It also reports `audit_requested` and `audit_completed` totals and distributions. A missing log is therefore never presented as a healthy all-zero window. These paths are printed only in the local report and are never written into effectiveness events.
@@ -170,6 +175,12 @@ python gardener.py groups --repo /path/to/repo
 # Cross-project candidate groups
 python gardener.py groups --repo /path/to/repo --knowledge-scope global
 ```
+
+### Promoted retrieval metadata
+
+`resolve --status promoted` accepts bounded optional `--task-type`, `--path-glob`, `--language`, `--tool`, `--platform`, `--negative-keyword`, `--min-score`, and `--supersedes` metadata. Scope, negative keywords, and path globs are hard filters; task type, language, tool, platform, and matching paths additionally boost a matching result. `estimated_tokens` is computed. To remove an active entry from retrieval without altering historical candidate/resolution evidence, use `resolve --status retired --reason stale|duplicate|superseded`; retirement is always explicit and audits never retire entries automatically.
+
+`index-audit` is read-only. It reports stale entries (90 days and at least 50 misses), normalized-summary duplicates, explicit supersession, orphaned target paths, and invalid metadata. It does not modify JSONL, SQLite, or promoted artifacts.
 
 Records created before `0.2.0` inside a repository have no `knowledge_scope`; they continue to load as `repository` and remain in that repository store. Version `0.4.0` also reads legacy user-level `$CODEX_HOME/learning/{inbox,index,resolutions}.jsonl` as global knowledge and copies it into the v2 global store at SessionStart or before a global write. Read-only reports can combine the legacy source in memory without changing it. Copies are marked `migration_provenance: legacy-user-learning-v1`, deduplicated by fingerprint/session or resolution identity, and the source files are preserved. Version `0.5.2` normalizes the two historical cross-project delegation Skill targets to `plugins/codex-gardener/skills/cross-project-delegation/SKILL.md`; all unrelated targets remain unchanged. Migrated evidence without project fingerprints cannot by itself satisfy the cross-project global promotion threshold.
 

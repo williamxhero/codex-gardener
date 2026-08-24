@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shlex
@@ -94,6 +95,25 @@ def standalone_delegation_skill() -> Path:
     return codex_home / "skills" / "cross-project-delegation" / "SKILL.md"
 
 
+def rebuild_global_index(repo_root: Path) -> dict[str, Any]:
+    """Build the local derived global index after installation, without network access."""
+    script = repo_root / "plugins" / "codex-gardener" / "scripts" / "retrieval.py"
+    spec = importlib.util.spec_from_file_location("codex_gardener_retrieval", script)
+    if spec is None or spec.loader is None:
+        raise InstallError("Could not load the bundled retrieval indexer.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    store = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "codex-gardener-global-learning"
+    store.mkdir(parents=True, exist_ok=True)
+    index = store / "index.jsonl"
+    if not index.exists():
+        index.write_text("", encoding="utf-8", newline="\n")
+    try:
+        return module.sync_scope(store)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise InstallError(f"Could not rebuild the local global retrieval index: {exc}") from exc
+
+
 def install(
     repo_root: Path,
     codex: str,
@@ -156,6 +176,8 @@ def install(
     else:
         print(f"Installing {PLUGIN_SELECTOR}...", file=output)
         run_command(add_plugin, runner)
+        rebuilt = rebuild_global_index(repo_root)
+        print(f"Rebuilt local global retrieval index ({rebuilt['entries']} entries).", file=output)
         print("Codex Gardener is installed.", file=output)
 
     if standalone_skill.is_file():

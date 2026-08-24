@@ -2055,6 +2055,28 @@ class GardenerTest(unittest.TestCase):
         self.assertNotIn("session-1", rendered)
         self.assertNotIn(str(self.root), rendered)
 
+    def test_retrieval_cli_metadata_retirement_and_hook_context_limit(self) -> None:
+        promoted = self.run_cli(
+            "resolve", "--repo", str(self.root), "--fingerprint", "abc123", "--status", "promoted",
+            "--summary", "Use parser contract guidance.", "--target-path", "AGENTS.md", "--keyword", "parser",
+            "--task-type", "bugfix", "--path-glob", "src/**", "--language", "python", "--tool", "shell",
+            "--platform", "windows", "--negative-keyword", "legacy", "--min-score", "0.75",
+        )
+        self.assertEqual(promoted["metadata"]["estimated_tokens"], 8)
+        self.assertTrue(self.run_cli("index-status", "--repo", str(self.root))["available"])
+        self.assertTrue(self.run_cli("index-audit", "--repo", str(self.root))["available"])
+        retired = self.run_cli(
+            "resolve", "--repo", str(self.root), "--fingerprint", "abc123", "--status", "retired", "--reason", "stale"
+        )
+        self.assertEqual(retired["status"], "retired")
+        self.assertEqual(self.run_cli("index-status", "--repo", str(self.root))["entries"], 0)
+
+        gardener.resolve_candidate(self.resolution_args(fingerprint="limit", keyword=["parser"]))
+        payload = self.payload(prompt="parser")
+        self.run_hook("SessionStart", payload)
+        output = self.run_hook("UserPromptSubmit", payload)
+        self.assertEqual(output["hookSpecificOutput"]["additionalContextLimit"], 600)
+
     def test_effectiveness_counts_effective_resolution_statuses(self) -> None:
         promoted = gardener.record_candidate(self.candidate_args(session_id="promoted-session"))
         discarded = gardener.record_candidate(
@@ -2099,7 +2121,7 @@ class GardenerTest(unittest.TestCase):
         )
         self.assertEqual(report["health"]["duplicate_enabled_plugin_ids"], ["codex-gardener@personal"])
         self.assertEqual(report["health"]["plugin_id"], "codex-gardener@codex-gardener")
-        self.assertEqual(report["health"]["plugin_version"], "0.6.1")
+        self.assertEqual(report["health"]["plugin_version"], "0.7.0")
         self.assertTrue(report["health"]["standalone_cross_project_skill_exists"])
         self.assertEqual(Path(report["health"]["standalone_cross_project_skill_path"]), standalone.resolve())
 
