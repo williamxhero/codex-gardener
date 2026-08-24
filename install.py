@@ -109,7 +109,7 @@ def rebuild_global_index(repo_root: Path) -> dict[str, Any]:
     if not index.exists():
         index.write_text("", encoding="utf-8", newline="\n")
     try:
-        return module.sync_scope(store)
+        return module.sync_scope(repo_root, "global")
     except (OSError, ValueError, RuntimeError) as exc:
         raise InstallError(f"Could not rebuild the local global retrieval index: {exc}") from exc
 
@@ -177,7 +177,7 @@ def install(
         print(f"Installing {PLUGIN_SELECTOR}...", file=output)
         run_command(add_plugin, runner)
         rebuilt = rebuild_global_index(repo_root)
-        print(f"Rebuilt local global retrieval index ({rebuilt['entries']} entries).", file=output)
+        print(f"Rebuilt local global retrieval index ({rebuilt['document_count']} entries).", file=output)
         print("Codex Gardener is installed.", file=output)
 
     if standalone_skill.is_file():

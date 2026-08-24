@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -36,12 +37,13 @@ EVENT_FIELDS: dict[str, set[str]] = {
         "injected",
         "eligible",
         "scored",
-        "filtered",
-        "threshold",
-        "token",
-        "latency_ms",
-        "rebuild",
-        "degraded",
+        "below_threshold",
+        "filtered_negative",
+        "filtered_path",
+        "estimated_tokens",
+        "retrieval_ms",
+        "index_rebuilt",
+        "retrieval_degraded",
     },
     "review_requested": {"session", "project", "signals", "run_kind"},
     "capture_recorded": {
@@ -89,7 +91,13 @@ COUNT_FIELDS = {
     "token",
     "latency_ms",
     "rebuild",
-    "degraded",
+    "retrieval_degraded",
+    "below_threshold",
+    "filtered_negative",
+    "filtered_path",
+    "estimated_tokens",
+    "retrieval_ms",
+    "index_rebuilt",
 }
 
 
@@ -312,6 +320,13 @@ def _rate(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 4) if denominator else 0.0
 
 
+def _percentile(values: list[int], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return float(ordered[min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1)])
+
+
 def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime | None = None) -> dict[str, Any]:
     if since_days < 0:
         raise ValueError("since-days must be non-negative")
@@ -344,6 +359,13 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
     lookups_with_hits = sum(1 for item in lookups if int(item.get("injected") or 0) > 0)
     boundary = [item for item in events if item["event"] == "project_boundary_denied"]
     audits = [item for item in events if item["event"] in {"audit_requested", "audit_completed"}]
+    latencies = [int(item.get("retrieval_ms", item.get("latency_ms", 0)) or 0) for item in lookups]
+    injected_tokens = [int(item.get("estimated_tokens", item.get("token", 0)) or 0) for item in lookups]
+    audit_counts = Counter()
+    for item in events:
+        if item["event"] == "audit_completed":
+            for key in ("stale-review", "exact-duplicate", "superseded-review", "orphaned-target", "invalid-metadata"):
+                audit_counts[key] += int(item.get(key, 0) or 0)
     return {
         "schema_version": EVENT_SCHEMA_VERSION,
         "window": {
@@ -401,12 +423,14 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
             "entries_injected": sum(int(item.get("injected") or 0) for item in lookups),
             "eligible": sum(int(item.get("eligible") or 0) for item in lookups),
             "scored": sum(int(item.get("scored") or 0) for item in lookups),
-            "filtered": sum(int(item.get("filtered") or 0) for item in lookups),
-            "threshold": sum(int(item.get("threshold") or 0) for item in lookups),
-            "token": sum(int(item.get("token") or 0) for item in lookups),
-            "latency_ms": sum(int(item.get("latency_ms") or 0) for item in lookups),
-            "rebuild": sum(int(item.get("rebuild") or 0) for item in lookups),
-            "degraded": sum(int(item.get("degraded") or 0) for item in lookups),
+            "avg_retrieval_ms": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
+            "p95_retrieval_ms": _percentile(latencies, .95),
+            "avg_injected_tokens": round(sum(injected_tokens) / len(injected_tokens), 2) if injected_tokens else 0.0,
+            "budget_utilization": _rate(sum(injected_tokens), max(1, len(lookups) * 500)),
+            "zero_injection_rate": _rate(sum(1 for item in lookups if int(item.get("injected") or 0) == 0), len(lookups)),
+            "filter_distribution": {"negative": sum(int(item.get("filtered_negative", item.get("filtered", 0)) or 0) for item in lookups), "path": sum(int(item.get("filtered_path") or 0) for item in lookups), "below_threshold": sum(int(item.get("below_threshold", item.get("threshold", 0)) or 0) for item in lookups)},
+            "rebuild_count": sum(int(item.get("index_rebuilt", item.get("rebuild", 0)) or 0) for item in lookups),
+            "degraded_count": sum(int(item.get("retrieval_degraded", item.get("degraded", 0)) or 0) for item in lookups),
         },
         "boundary": {
             "denials": len(boundary),
@@ -418,4 +442,5 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
                 sorted(Counter(str(item.get("operation")) for item in events if item["event"] == "operation_error").items())
             ),
         },
+        "audit_issue_counts": dict(sorted(audit_counts.items())),
     }

@@ -178,7 +178,7 @@ python gardener.py groups --repo /path/to/repo --knowledge-scope global
 
 ### Promoted retrieval metadata
 
-`resolve --status promoted` accepts bounded optional `--task-type`, `--path-glob`, `--language`, `--tool`, `--platform`, `--negative-keyword`, `--min-score`, and `--supersedes` metadata. Scope, negative keywords, and path globs are hard filters; task type, language, tool, platform, and matching paths additionally boost a matching result. `estimated_tokens` is computed. To remove an active entry from retrieval without altering historical candidate/resolution evidence, use `resolve --status retired --reason stale|duplicate|superseded`; retirement is always explicit and audits never retire entries automatically.
+`resolve --status promoted` accepts bounded optional `--task-type`, `--path-glob`, `--language`, `--tool`, `--platform`, `--negative-keyword`, `--min-score`, and repeatable `--supersedes` metadata. Scope, normalized negative phrases, and path globs are hard filters; task type, language, tool, platform, and matching paths additionally boost a matching result. `estimated_tokens` is always calculated from the final rendered injection line. To remove an active entry from retrieval without altering historical candidate/resolution evidence, use `resolve --status retired --reason stale|duplicate|superseded`; retirement is always explicit and audits never retire entries automatically.
 
 `index-audit` is read-only. It reports stale entries (90 days and at least 50 misses), normalized-summary duplicates, explicit supersession, orphaned target paths, and invalid metadata. It does not modify JSONL, SQLite, or promoted artifacts.
 

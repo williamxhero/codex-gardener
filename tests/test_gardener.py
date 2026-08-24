@@ -1576,6 +1576,7 @@ class GardenerTest(unittest.TestCase):
                 "promoted_at": "2026-01-01T00:00:00Z",
             },
         )
+        self.run_hook("SessionStart", self.payload(session_id="legacy-index", turn_id="legacy-index"))
         self.assertIn("[repository]", gardener.promoted_context(self.root, "legacy context") or "")
         self.assertIsNone(gardener.promoted_context(self.other, "legacy context"))
 
@@ -2062,14 +2063,21 @@ class GardenerTest(unittest.TestCase):
             "--task-type", "bugfix", "--path-glob", "src/**", "--language", "python", "--tool", "shell",
             "--platform", "windows", "--negative-keyword", "legacy", "--min-score", "0.75",
         )
-        self.assertEqual(promoted["metadata"]["estimated_tokens"], 8)
-        self.assertTrue(self.run_cli("index-status", "--repo", str(self.root))["available"])
-        self.assertTrue(self.run_cli("index-audit", "--repo", str(self.root))["available"])
+        self.assertEqual(
+            promoted["metadata"]["estimated_tokens"],
+            gardener.retrieval.estimate_tokens(
+                gardener.retrieval.render_line(
+                    {"knowledge_scope": "repository", "summary": "Use parser contract guidance.", "target_path": "AGENTS.md"}
+                )
+            ),
+        )
+        self.assertTrue(self.run_cli("index-status", "--repo", str(self.root))["in_sync"])
+        self.assertIn("issues", self.run_cli("index-audit", "--repo", str(self.root)))
         retired = self.run_cli(
             "resolve", "--repo", str(self.root), "--fingerprint", "abc123", "--status", "retired", "--reason", "stale"
         )
         self.assertEqual(retired["status"], "retired")
-        self.assertEqual(self.run_cli("index-status", "--repo", str(self.root))["entries"], 0)
+        self.assertEqual(self.run_cli("index-status", "--repo", str(self.root))["document_count"], 0)
 
         gardener.resolve_candidate(self.resolution_args(fingerprint="limit", keyword=["parser"]))
         payload = self.payload(prompt="parser")

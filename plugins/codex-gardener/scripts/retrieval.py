@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Derived, privacy-bounded SQLite retrieval for promoted Gardener knowledge.
+"""Bounded, privacy-preserving promoted-knowledge retrieval.
 
-``index.jsonl`` is authoritative.  This module stores only normalized promoted
-metadata and aggregate counters in SQLite; prompts, tool output, and query terms
-are deliberately never written to disk.
+The JSONL index is authoritative only while rebuilding or auditing.  Normal
+retrieval deliberately consults only SQLite and the JSONL file's size/mtime,
+so a hot prompt neither reads the JSONL nor scans all documents.
 """
-
 from __future__ import annotations
 
 import contextlib
 import fnmatch
-import hashlib
 import json
 import math
 import os
@@ -24,459 +22,392 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-
 INDEX_NAME = "index.jsonl"
 DATABASE_NAME = "retrieval.sqlite3"
-SCHEMA_VERSION = 1
-K1 = 1.2
-B = 0.75
-DEFAULT_MIN_SCORE = 0.75
-MAX_RESULTS = 3
-MAX_CONTEXT_TOKENS = 500
-LOCK_TIMEOUT_SECONDS = 0.25
-MAX_PATHS = 32
-MAX_FIELD_ITEMS = 16
-MAX_FIELD_TEXT = 160
-WORD_RE = re.compile(r"[\w.-]+", re.UNICODE)
-CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+SCHEMA_VERSION = 2
+K1, B = 1.2, .75
+DEFAULT_MIN_SCORE, MAX_RESULTS, MAX_CONTEXT_TOKENS = .75, 3, 500
+LOCK_TIMEOUT_SECONDS, MAX_PATHS, MAX_FIELD_ITEMS = .25, 32, 16
+SLUG_RE = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{6,128}$")
+CJK_RUN_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
+WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[A-Za-z0-9_.\-/\\:]*[A-Za-z0-9])?")
 PATH_RE = re.compile(r"(?<!\w)(?:[A-Za-z]:[\\/])?[\w.@+-]+(?:[\\/][\w.@+ -]+)+")
 
-
 class RetrievalError(RuntimeError):
-    """The derived index is unavailable; callers must fail open."""
-
+    pass
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+def _code_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 
-def normalize_text(value: Any) -> str:
-    return unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
-
-
-def tokenize(value: Any) -> list[str]:
-    """NFKC/casefold identifier tokens plus CJK unigrams and adjacent bigrams."""
-    text = normalize_text(value)
-    tokens: list[str] = []
-    for word in WORD_RE.findall(text):
-        for part in re.split(r"[_./\\:-]+", word):
-            if part:
-                tokens.append(part)
-    chars = CJK_RE.findall(text)
-    tokens.extend(chars)
-    tokens.extend("".join(chars[index : index + 2]) for index in range(max(0, len(chars) - 1)))
-    return tokens
-
-
-def normalized_summary(value: Any) -> str:
-    return " ".join(tokenize(value))
-
-
-def estimate_tokens(value: Any) -> int:
-    text = str(value or "")
-    return max(1, math.ceil(len(text) / 4))
-
-
-def source_signature(index_path: Path) -> str:
-    try:
-        data = index_path.read_bytes()
-    except OSError as exc:
-        raise RetrievalError("authoritative index is unavailable") from exc
-    return hashlib.sha256(data).hexdigest()
-
+def store_for(repo: Path | str, knowledge_scope: str) -> Path:
+    root = Path(repo).resolve()
+    if knowledge_scope == "repository":
+        # Compatibility for direct internal maintenance calls. Hook/CLI callers
+        # use a repository root; this branch keeps old local test fixtures from
+        # becoming a second public persistence API.
+        if (root / INDEX_NAME).is_file() or root.name == "learning":
+            return root
+        return root / ".codex" / "learning"
+    if knowledge_scope == "global":
+        return _code_home() / "codex-gardener-global-learning"
+    raise ValueError("knowledge_scope must be repository or global")
 
 def database_path(store: Path) -> Path:
     return store / DATABASE_NAME
 
+def normalize_text(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
 
-def _connect(path: Path, *, write: bool = False) -> sqlite3.Connection:
+def normalize_phrase(value: Any) -> str:
+    return " ".join(normalize_text(value).split())
+
+def _camel_parts(word: str) -> list[str]:
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", word).split()
+
+def tokenize(value: Any) -> list[str]:
+    """Identifier-aware tokens and CJK uni/bigrams within each contiguous run."""
+    original = unicodedata.normalize("NFKC", str(value or ""))
+    tokens: list[str] = []
+    for word in WORD_RE.findall(original):
+        for piece in re.split(r"[\s./\\:_-]+", word):
+            tokens.extend(part.casefold() for part in _camel_parts(piece) if part)
+    for run in CJK_RUN_RE.findall(original):
+        tokens.extend(run)
+        tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
+    return tokens
+
+def normalized_summary(value: Any) -> str:
+    return normalize_phrase(value)
+
+def estimate_tokens(value: Any) -> int:
+    text = str(value or "")
+    cjk = sum(1 for char in text if CJK_RUN_RE.fullmatch(char))
+    other = sum(1 for char in text if not char.isspace() and not CJK_RUN_RE.fullmatch(char))
+    return cjk + math.ceil(other / 4)
+
+def render_line(entry: dict[str, Any]) -> str:
+    title = str(entry.get("title") or entry.get("scope") or "Promoted knowledge")
+    scope = str(entry.get("knowledge_scope") or "repository")
+    return f"- [{scope}] {title}: {entry.get('summary', '')} (source: {entry.get('target_path', '')})"
+
+def _stat_signature(index: Path) -> tuple[int, int]:
     try:
-        connection = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SECONDS, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout = 250")
-        if write:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = NORMAL")
-        return connection
-    except sqlite3.Error as exc:
-        raise RetrievalError("retrieval database is unavailable") from exc
-
-
-def _list(value: Any, name: str, *, patterns: bool = False) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > MAX_FIELD_ITEMS:
-        raise ValueError(f"{name} must contain at most {MAX_FIELD_ITEMS} values")
-    output: list[str] = []
-    for item in value:
-        text = normalize_text(item)
-        if not text or len(text) > MAX_FIELD_TEXT:
-            raise ValueError(f"{name} contains an invalid value")
-        if patterns and (Path(str(item)).is_absolute() or ".." in Path(str(item)).parts):
-            raise ValueError("path_globs must be relative")
-        output.append(text)
-    return sorted(set(output))
-
-
-def validate_metadata(record: dict[str, Any]) -> dict[str, Any]:
-    """Validate accepted promoted metadata and compute bounded derived fields."""
-    metadata = {
-        "task_types": _list(record.get("task_types", []), "task_types"),
-        "path_globs": _list(record.get("path_globs", []), "path_globs", patterns=True),
-        "languages": _list(record.get("languages", []), "languages"),
-        "tools": _list(record.get("tools", []), "tools"),
-        "platforms": _list(record.get("platforms", []), "platforms"),
-        "negative_keywords": _list(record.get("negative_keywords", []), "negative_keywords"),
-    }
-    minimum = record.get("min_score", DEFAULT_MIN_SCORE)
-    try:
-        minimum = float(minimum)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("min_score must be numeric") from exc
-    if not 0.0 <= minimum <= 20.0:
-        raise ValueError("min_score must be between 0 and 20")
-    supersedes = record.get("supersedes")
-    if supersedes is not None:
-        supersedes = str(supersedes).strip()
-        if not re.fullmatch(r"[0-9a-f]{6,128}", supersedes):
-            raise ValueError("supersedes must be a fingerprint")
-    metadata["min_score"] = minimum
-    metadata["supersedes"] = supersedes
-    metadata["estimated_tokens"] = estimate_tokens(record.get("summary"))
-    return metadata
-
-
-def _records(store: Path) -> list[dict[str, Any]]:
-    path = store / INDEX_NAME
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        stat = index.stat()
+        return stat.st_size, stat.st_mtime_ns
     except OSError as exc:
         raise RetrievalError("authoritative index is unavailable") from exc
+
+def _connect(path: Path, *, write: bool = False, readonly: bool = False) -> sqlite3.Connection:
+    connection: sqlite3.Connection | None = None
+    try:
+        if readonly:
+            connection = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=LOCK_TIMEOUT_SECONDS, isolation_level=None)
+        else:
+            connection = sqlite3.connect(path, timeout=LOCK_TIMEOUT_SECONDS, isolation_level=None)
+        connection.execute("PRAGMA busy_timeout = 250")
+        if write:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+        return connection
+    except sqlite3.Error as exc:
+        if connection is not None:
+            with contextlib.suppress(sqlite3.Error): connection.close()
+        raise RetrievalError("retrieval database is unavailable") from exc
+
+def _slug_list(value: Any, name: str) -> list[str]:
+    if value is None: return []
+    if not isinstance(value, list) or len(value) > MAX_FIELD_ITEMS: raise ValueError(f"{name} must contain at most 16 values")
+    result: list[str] = []
+    for item in value:
+        raw, text = str(item), normalize_text(item)
+        if len(text) > 80 or raw != text or not SLUG_RE.fullmatch(text): raise ValueError(f"{name} contains an invalid lowercase slug")
+        result.append(text)
+    return sorted(set(result))
+
+def _phrases(value: Any) -> list[str]:
+    if value is None: return []
+    if not isinstance(value, list) or len(value) > MAX_FIELD_ITEMS: raise ValueError("negative_keywords must contain at most 16 values")
+    result = [normalize_phrase(item) for item in value]
+    if any(not item or len(item) > 80 for item in result): raise ValueError("negative_keywords contains an invalid value")
+    return sorted(set(result))
+
+def _path_globs(value: Any) -> list[str]:
+    if value is None: return []
+    if not isinstance(value, list) or len(value) > MAX_FIELD_ITEMS: raise ValueError("path_globs must contain at most 16 values")
+    result: list[str] = []
+    for item in value:
+        path = str(item).replace("\\", "/").strip()
+        parts = path.split("/")
+        if not path or len(path) > 200 or path.startswith("/") or re.match(r"^[A-Za-z]:/", path) or ".." in parts:
+            raise ValueError("path_globs must be normalized relative paths")
+        result.append(path)
+    return sorted(set(result))
+
+def validate_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    metadata = {key: _slug_list(record.get(key, []), key) for key in ("task_types", "languages", "tools", "platforms")}
+    metadata["negative_keywords"] = _phrases(record.get("negative_keywords", []))
+    metadata["path_globs"] = _path_globs(record.get("path_globs", []))
+    try: minimum = float(record.get("min_score", DEFAULT_MIN_SCORE))
+    except (ValueError, TypeError) as exc: raise ValueError("min_score must be numeric") from exc
+    if not 0 <= minimum <= 20: raise ValueError("min_score must be between 0 and 20")
+    supersedes = record.get("supersedes", [])
+    if supersedes is None: supersedes = []
+    if not isinstance(supersedes, list) or len(supersedes) > MAX_FIELD_ITEMS: raise ValueError("supersedes must be a bounded list")
+    if any(not isinstance(item, str) or not FINGERPRINT_RE.fullmatch(item) for item in supersedes): raise ValueError("supersedes must contain fingerprints")
+    metadata.update(min_score=minimum, supersedes=sorted(set(supersedes)))
+    return metadata
+
+def _records(store: Path, knowledge_scope: str) -> list[dict[str, Any]]:
+    try: lines = (store / INDEX_NAME).read_text(encoding="utf-8").splitlines()
+    except OSError as exc: raise RetrievalError("authoritative index is unavailable") from exc
     result: list[dict[str, Any]] = []
     for line in lines:
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise RetrievalError("authoritative index is corrupt") from exc
-        if not isinstance(value, dict):
-            raise RetrievalError("authoritative index is corrupt")
-        fingerprint = str(value.get("fingerprint") or "")
-        summary = str(value.get("summary") or "").strip()
-        if not fingerprint or not summary:
+        try: entry = json.loads(line)
+        except json.JSONDecodeError as exc: raise RetrievalError("authoritative index is corrupt") from exc
+        if not isinstance(entry, dict) or not str(entry.get("fingerprint") or "").strip() or not str(entry.get("summary") or "").strip():
             raise RetrievalError("authoritative index has an invalid promoted entry")
-        entry = dict(value)
-        entry.update(validate_metadata(entry))
+        entry = dict(entry); entry.update(validate_metadata(entry)); entry["knowledge_scope"] = knowledge_scope
+        entry["estimated_tokens"] = estimate_tokens(render_line(entry))
         result.append(entry)
     return result
 
-
 def _schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE entries (
-          fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL, summary_norm TEXT NOT NULL,
-          doc_len INTEGER NOT NULL, last_used_at TEXT, hit_count INTEGER NOT NULL DEFAULT 0,
-          eligible_count INTEGER NOT NULL DEFAULT 0, miss_count_since_hit INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE terms (fingerprint TEXT NOT NULL, term TEXT NOT NULL, tf REAL NOT NULL,
-          PRIMARY KEY (fingerprint, term));
-        CREATE INDEX terms_term ON terms(term);
-        """
-    )
-
+    connection.executescript("""
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE documents (fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL, summary_norm TEXT NOT NULL, doc_len INTEGER NOT NULL, promoted_at TEXT NOT NULL DEFAULT '');
+    CREATE TABLE postings (term TEXT NOT NULL, fingerprint TEXT NOT NULL, tf REAL NOT NULL, PRIMARY KEY(term,fingerprint));
+    CREATE INDEX postings_fingerprint ON postings(fingerprint);
+    CREATE TABLE term_stats (term TEXT PRIMARY KEY, df INTEGER NOT NULL);
+    CREATE TABLE usage (fingerprint TEXT PRIMARY KEY, last_used_at TEXT, hit_count INTEGER NOT NULL DEFAULT 0, eligible_count INTEGER NOT NULL DEFAULT 0, miss_count_since_hit INTEGER NOT NULL DEFAULT 0);
+    """)
 
 def _weighted_terms(entry: dict[str, Any]) -> Counter[str]:
-    terms: Counter[str] = Counter()
-    for token, count in Counter(tokenize(entry.get("summary"))).items():
-        terms[token] += count
+    terms = Counter(tokenize(entry.get("summary")))
     for keyword in entry.get("keywords", []) if isinstance(entry.get("keywords"), list) else []:
-        for token in tokenize(keyword):
-            terms[token] += 3
+        terms.update({token: 3 for token in tokenize(keyword)})
     return terms
 
+def _old_usage(path: Path) -> dict[str, tuple[Any, ...]]:
+    if not path.is_file(): return {}
+    try:
+        connection = _connect(path, readonly=True)
+        try:
+            return {str(row[0]): tuple(row[1:]) for row in connection.execute("SELECT fingerprint,last_used_at,hit_count,eligible_count,miss_count_since_hit FROM usage")}
+        finally: connection.close()
+    except (RetrievalError, sqlite3.Error): return {}
 
-def sync_scope(store: Path | str) -> dict[str, Any]:
-    """Atomically rebuild the complete derived index from authoritative JSONL."""
-    store = Path(store)
-    records = _records(store)
-    signature = source_signature(store / INDEX_NAME)
-    store.mkdir(parents=True, exist_ok=True)
-    target = database_path(store)
-    fd, temporary_name = tempfile.mkstemp(prefix=".retrieval.", suffix=".sqlite3", dir=store)
-    os.close(fd)
-    temporary = Path(temporary_name)
+def _clean_sidecars(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        with contextlib.suppress(OSError): path.with_name(path.name + suffix).unlink()
+
+def sync_scope(repo: Path | str, knowledge_scope: str = "repository") -> dict[str, Any]:
+    """Rebuild one derived scope transactionally; retain its previous healthy DB on failure."""
+    store = store_for(repo, knowledge_scope); store.mkdir(parents=True, exist_ok=True)
+    records = _records(store, knowledge_scope); size, mtime_ns = _stat_signature(store / INDEX_NAME)
+    target = database_path(store); previous_usage = _old_usage(target)
+    fd, raw = tempfile.mkstemp(prefix=".retrieval-rebuild-", suffix=".sqlite3", dir=store); os.close(fd); temporary = Path(raw)
     try:
         connection = _connect(temporary, write=True)
         try:
-            _schema(connection)
-            connection.execute("BEGIN IMMEDIATE")
+            _schema(connection); connection.execute("BEGIN IMMEDIATE")
             for entry in records:
-                payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                terms = _weighted_terms(entry)
-                connection.execute(
-                    "INSERT INTO entries(fingerprint,payload,summary_norm,doc_len) VALUES(?,?,?,?)",
-                    (str(entry["fingerprint"]), payload, normalized_summary(entry["summary"]), max(1, sum(terms.values()))),
-                )
-                connection.executemany(
-                    "INSERT INTO terms(fingerprint,term,tf) VALUES(?,?,?)",
-                    [(str(entry["fingerprint"]), term, float(tf)) for term, tf in terms.items()],
-                )
-            connection.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-            connection.execute("INSERT INTO meta(key,value) VALUES('source_signature',?)", (signature,))
-            connection.execute("INSERT INTO meta(key,value) VALUES('rebuilt_at',?)", (_now(),))
-            connection.execute("COMMIT")
-        finally:
-            connection.close()
+                terms = _weighted_terms(entry); fingerprint = str(entry["fingerprint"])
+                connection.execute("INSERT INTO documents VALUES(?,?,?,?,?)", (fingerprint, json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")), normalized_summary(entry["summary"]), max(1, sum(terms.values())), str(entry.get("promoted_at") or "")))
+                connection.executemany("INSERT INTO postings VALUES(?,?,?)", [(term, fingerprint, float(tf)) for term, tf in terms.items()])
+                connection.execute("INSERT INTO usage VALUES(?,?,?,?,?)", (fingerprint, *previous_usage.get(fingerprint, (None, 0, 0, 0))))
+            connection.execute("INSERT INTO term_stats SELECT term,COUNT(*) FROM postings GROUP BY term")
+            values = {"schema": SCHEMA_VERSION, "document_count": len(records), "average_length": (sum(max(1, sum(_weighted_terms(e).values())) for e in records) / max(1, len(records))), "index_size": size, "index_mtime_ns": mtime_ns, "last_successful_rebuild": _now()}
+            connection.executemany("INSERT INTO meta VALUES(?,?)", [(key, str(value)) for key, value in values.items()]); connection.execute("COMMIT")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally: connection.close()
+        check = _connect(temporary, readonly=True)
+        try:
+            if int(check.execute("SELECT value FROM meta WHERE key='schema'").fetchone()[0]) != SCHEMA_VERSION or check.execute("SELECT COUNT(*) FROM documents").fetchone()[0] != len(records): raise RetrievalError("temporary index validation failed")
+        finally: check.close()
         os.replace(temporary, target)
-    except (OSError, sqlite3.Error, ValueError) as exc:
+    except (OSError, sqlite3.Error, ValueError, RetrievalError) as exc:
         raise RetrievalError("retrieval index rebuild failed") from exc
-    finally:
-        with contextlib.suppress(OSError):
-            temporary.unlink()
-    return {"scope_path": str(store), "entries": len(records), "source_signature": signature, "rebuilt_at": _now()}
+    finally: _clean_sidecars(temporary)
+    return {"schema": SCHEMA_VERSION, "document_count": len(records), "last_successful_rebuild": _now(), "in_sync": True, "needs_rebuild": False}
 
-
-def _read_index(store: Path) -> sqlite3.Connection:
+def _read_index(store: Path, *, readonly: bool = False) -> sqlite3.Connection:
     path = database_path(store)
-    if not path.is_file():
-        raise RetrievalError("retrieval index is missing")
-    connection = _connect(path)
+    if not path.is_file(): raise RetrievalError("retrieval index is missing")
+    connection = _connect(path, write=not readonly, readonly=readonly)
     try:
-        row = connection.execute("SELECT value FROM meta WHERE key='source_signature'").fetchone()
-        version = connection.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        if not row or not version or version[0] != str(SCHEMA_VERSION) or row[0] != source_signature(store / INDEX_NAME):
-            raise RetrievalError("retrieval index is stale")
+        meta = dict(connection.execute("SELECT key,value FROM meta WHERE key IN ('schema','index_size','index_mtime_ns')"))
+        size, mtime_ns = _stat_signature(store / INDEX_NAME)
+        if meta.get("schema") != str(SCHEMA_VERSION) or meta.get("index_size") != str(size) or meta.get("index_mtime_ns") != str(mtime_ns): raise RetrievalError("retrieval index is stale")
+        return connection
     except Exception:
-        connection.close()
-        raise
-    return connection
-
+        connection.close(); raise
 
 def _context_values(context: dict[str, Any] | None, name: str) -> set[str]:
-    value = (context or {}).get(name, [])
-    if isinstance(value, str):
-        value = [value]
-    return {normalize_text(item) for item in value if normalize_text(item)} if isinstance(value, list) else set()
+    values = (context or {}).get(name, []); values = [values] if isinstance(values, str) else values
+    return {normalize_text(value) for value in values if normalize_text(value)} if isinstance(values, list) else set()
 
+TASK_ALIASES = {"debug": ("debug", "bug", "fix", "调试", "修复"), "deploy": ("deploy", "deployment", "部署"), "refactor": ("refactor", "重构"), "research": ("research", "研究"), "test": ("test", "测试"), "review": ("review", "审查", "评审"), "docs": ("docs", "document", "文档"), "build": ("build", "构建", "编译"), "data": ("data", "数据"), "ops": ("ops", "operation", "运维"), "unity": ("unity",), "quant": ("quant", "量化")}
+MARKERS = {"python": ("pyproject.toml", "requirements.txt"), "javascript": ("package.json",), "typescript": ("tsconfig.json",), "rust": ("cargo.toml",), "go": ("go.mod",), "java": ("pom.xml", "build.gradle"), "csharp": (".sln", ".csproj")}
+EXTENSIONS = {".py":"python", ".js":"javascript", ".jsx":"javascript", ".ts":"typescript", ".tsx":"typescript", ".rs":"rust", ".go":"go", ".java":"java", ".cs":"csharp"}
 
-def derive_task_context(prompt: str, repo: Path | None = None, *, tool_names: Iterable[str] = ()) -> dict[str, list[str]]:
-    """Derive only bounded transient context. Nothing returned here is persisted."""
-    paths: list[str] = []
-    if repo is not None:
-        root = repo.resolve()
-        for raw in PATH_RE.findall(prompt):
-            candidate = Path(raw)
+def derive_task_context(prompt: str, repo: Path | None = None, *, tool_names: Iterable[str] = (), tool_parameters: Iterable[Any] = ()) -> dict[str, list[str]]:
+    root = repo.resolve() if repo else None; paths: set[str] = set()
+    def add_paths(value: Any) -> None:
+        for raw in PATH_RE.findall(str(value or "")):
+            if not root: continue
             try:
-                resolved = (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
-                paths.append(str(resolved.relative_to(root)).replace("\\", "/"))
-            except (OSError, ValueError):
-                continue
-        # Root marker inspection is deliberately bounded and has no recursion.
-        with contextlib.suppress(OSError):
-            for child in sorted(root.iterdir(), key=lambda item: item.name.casefold())[:16]:
-                if child.name in {"AGENTS.md", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"}:
-                    paths.append(child.name)
-    words = set(tokenize(prompt))
-    task_types = [kind for kind in ("bugfix", "feature", "refactor", "test", "docs", "deploy") if kind in words]
-    languages = [language for language in ("python", "javascript", "typescript", "rust", "go", "java", "csharp") if language in words]
-    platforms = ["windows" if os.name == "nt" else "linux" if os.name == "posix" else os.name]
-    return {
-        "task_types": task_types,
-        "paths": sorted(set(paths))[:MAX_PATHS],
-        "languages": languages,
-        "tools": sorted({normalize_text(item) for item in tool_names if normalize_text(item)})[:MAX_FIELD_ITEMS],
-        "platforms": platforms,
-    }
+                candidate = Path(raw); relative = (root / candidate).resolve().relative_to(root) if not candidate.is_absolute() else candidate.resolve().relative_to(root)
+                paths.add(relative.as_posix())
+            except (OSError, ValueError): pass
+    add_paths(prompt)
+    for parameter in list(tool_parameters)[:16]: add_paths(parameter)
+    marker_names: set[str] = set()
+    if root:
+        with contextlib.suppress(OSError): marker_names = {child.name.casefold() for child in list(root.iterdir())[:64]}
+    words = set(tokenize(prompt)); prompt_norm = normalize_phrase(prompt)
+    task_types = [kind for kind, aliases in TASK_ALIASES.items() if any(alias in words or alias in prompt_norm for alias in aliases)]
+    languages = {lang for suffix, lang in EXTENSIONS.items() if any(path.casefold().endswith(suffix) for path in paths)}
+    languages.update(lang for lang, markers in MARKERS.items() if any(marker in marker_names or marker.lstrip(".") in marker_names for marker in markers))
+    languages.update(lang for lang in MARKERS if lang in words)
+    tools = {normalize_text(name) for name in tool_names if normalize_text(name)}
+    tools.update(tool for tool in ("pytest","unittest","npm","pnpm","yarn","cargo","go","dotnet","git","python") if tool in words or tool in prompt_norm)
+    platform = "windows" if os.name == "nt" else "linux" if os.name == "posix" else os.name
+    platforms = {platform}; platforms.update(item for item in ("windows","linux","macos","android","ios","web") if item in words)
+    return {"task_types": sorted(task_types)[:16], "paths": sorted(paths)[:MAX_PATHS], "languages": sorted(languages)[:16], "tools": sorted(tools)[:16], "platforms": sorted(platforms)[:16]}
 
-
-def _eligible(entry: dict[str, Any], terms: set[str], context: dict[str, Any] | None) -> bool:
-    if terms & set(entry.get("negative_keywords", [])):
-        return False
-    patterns = entry.get("path_globs", [])
-    if patterns:
-        paths = _context_values(context, "paths")
-        if not paths or not any(fnmatch.fnmatch(path, pattern) for path in paths for pattern in patterns):
-            return False
-    return True
-
+def _gate(entry: dict[str, Any], prompt_phrase: str, context: dict[str, Any] | None) -> str | None:
+    if any(keyword in prompt_phrase for keyword in entry.get("negative_keywords", [])): return "negative"
+    patterns = entry.get("path_globs", []); paths = _context_values(context, "paths")
+    if patterns and (not paths or not any(fnmatch.fnmatchcase(path, pattern) for path in paths for pattern in patterns)): return "path"
+    return None
 
 def _metadata_boost(entry: dict[str, Any], context: dict[str, Any] | None) -> float:
-    boosts = {"task_types": 1.0, "languages": 0.5, "tools": 0.75, "platforms": 0.5}
-    return sum(boosts[key] for key in boosts if set(entry.get(key, [])).intersection(_context_values(context, key))) + (
-        1.0 if entry.get("path_globs") and _context_values(context, "paths") else 0.0
-    )
-
-
-def retrieve(store: Path | str, prompt: str, *, task_context: dict[str, Any] | None = None,
-             error_logger: Callable[[str], None] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Retrieve up to three entries. Degraded sources fail open without JSON fallback."""
-    started = time.monotonic()
-    metrics: dict[str, Any] = {"eligible": 0, "scored": 0, "filtered": 0, "threshold": 0, "token": 0, "injected": 0,
-                               "latency_ms": 0, "rebuild": 0, "degraded": False}
-    terms = tokenize(prompt)
-    phrase = normalize_text(prompt)
-    if not terms:
-        return [], metrics
-    try:
-        connection = _read_index(Path(store))
-        try:
-            rows = connection.execute("SELECT fingerprint,payload,summary_norm,doc_len FROM entries ORDER BY fingerprint").fetchall()
-            count = len(rows)
-            average = max(1.0, sum(int(row[3]) for row in rows) / max(1, count))
-            scored: list[tuple[float, dict[str, Any]]] = []
-            query = Counter(terms)
-            placeholders = ",".join("?" for _ in query)
-            term_rows = connection.execute(
-                f"SELECT fingerprint,term,tf FROM terms WHERE term IN ({placeholders})", tuple(query)
-            ).fetchall()
-            frequencies = Counter(str(term) for _, term, _ in term_rows)
-            term_values = {(str(fingerprint), str(term)): float(tf) for fingerprint, term, tf in term_rows}
-            term_set = set(terms)
-            eligible_fingerprints: list[str] = []
-            for fingerprint, payload, summary_norm, doc_len in rows:
-                entry = json.loads(payload)
-                if not _eligible(entry, term_set, task_context):
-                    metrics["filtered"] += 1
-                    continue
-                metrics["eligible"] += 1
-                eligible_fingerprints.append(str(fingerprint))
-                score = 0.0
-                for term, qtf in query.items():
-                    df = frequencies[term]
-                    tf = term_values.get((str(fingerprint), term))
-                    if tf is not None:
-                        idf = math.log(1 + (count - df + 0.5) / (df + 0.5))
-                        score += qtf * idf * ((tf * (K1 + 1)) / (tf + K1 * (1 - B + B * int(doc_len) / average)))
-                if phrase and phrase in summary_norm:
-                    score += 2.0
-                # Keywords are an explicit curated field boost, not merely a
-                # copy of summary text. This preserves useful one-keyword
-                # retrieval under the conservative default threshold.
-                score += 3.0 * sum(
-                    1
-                    for keyword in entry.get("keywords", []) if normalize_text(keyword) in term_set
-                )
-                score += _metadata_boost(entry, task_context)
-                if score < float(entry.get("min_score", DEFAULT_MIN_SCORE)):
-                    metrics["threshold"] += 1
-                    continue
-                metrics["scored"] += 1
-                entry["score"] = round(score, 6)
-                scored.append((score, entry))
-            scored.sort(key=lambda item: (-item[0], str(item[1].get("promoted_at") or ""), str(item[1].get("fingerprint"))))
-            selected: list[dict[str, Any]] = []
-            tokens = 0
-            for _, entry in scored:
-                cost = int(entry.get("estimated_tokens") or estimate_tokens(entry.get("summary")))
-                if len(selected) >= MAX_RESULTS or tokens + cost > MAX_CONTEXT_TOKENS:
-                    metrics["token"] += 1
-                    continue
-                selected.append(entry)
-                tokens += cost
-            selected_ids = {str(item["fingerprint"]) for item in selected}
-            # Aggregate counters are permitted derived effectiveness data; no query data is stored.
-            connection.execute("BEGIN IMMEDIATE")
-            now = _now()
-            hits = [(now, fingerprint) for fingerprint in eligible_fingerprints if fingerprint in selected_ids]
-            misses = [(fingerprint,) for fingerprint in eligible_fingerprints if fingerprint not in selected_ids]
-            connection.executemany(
-                "UPDATE entries SET eligible_count=eligible_count+1,hit_count=hit_count+1,last_used_at=?,miss_count_since_hit=0 WHERE fingerprint=?", hits
-            )
-            connection.executemany(
-                "UPDATE entries SET eligible_count=eligible_count+1,miss_count_since_hit=miss_count_since_hit+1 WHERE fingerprint=?", misses
-            )
-            connection.execute("COMMIT")
-            metrics["injected"] = len(selected)
-            return selected, metrics
-        finally:
-            connection.close()
-    except (RetrievalError, sqlite3.Error, json.JSONDecodeError, OSError, ValueError) as exc:
-        metrics["degraded"] = True
-        if error_logger and "missing" not in str(exc):
-            error_logger("retrieval")
-        return [], metrics
-    finally:
-        metrics["latency_ms"] = int((time.monotonic() - started) * 1000)
-
-
-def index_status(store: Path | str) -> dict[str, Any]:
-    store = Path(store)
-    result: dict[str, Any] = {"scope_path": str(store), "available": False, "stale": True, "entries": 0, "degraded": False}
-    try:
-        connection = _read_index(store)
-        try:
-            result.update({"available": True, "stale": False, "entries": connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
-                           "source_signature": connection.execute("SELECT value FROM meta WHERE key='source_signature'").fetchone()[0],
-                           "rebuilt_at": connection.execute("SELECT value FROM meta WHERE key='rebuilt_at'").fetchone()[0]})
-        finally:
-            connection.close()
-    except RetrievalError:
-        result["degraded"] = True
+    boosts = {"task_types":1., "languages":.5, "tools":.75, "platforms":.5}
+    result = sum(value for key, value in boosts.items() if set(entry.get(key, [])).intersection(_context_values(context, key)))
+    if entry.get("path_globs") and any(fnmatch.fnmatchcase(path, pattern) for path in _context_values(context, "paths") for pattern in entry["path_globs"]): result += 1.
     return result
 
-
-def audit_scope(store: Path | str, *, now: datetime | None = None) -> dict[str, Any]:
-    """Read-only retrieval health audit; it never changes JSONL or SQLite."""
-    store = Path(store)
-    current = now or datetime.now(timezone.utc)
-    issues: list[dict[str, Any]] = []
-    # Validate the authoritative source separately so invalid future metadata is
-    # reported even when it prevents a derived rebuild.
-    with contextlib.suppress(OSError):
-        for line in (store / INDEX_NAME).read_text(encoding="utf-8").splitlines():
-            raw: Any = None
-            try:
-                raw = json.loads(line)
-                if not isinstance(raw, dict):
-                    raise ValueError("not an object")
-                validate_metadata(raw)
-            except (ValueError, TypeError, json.JSONDecodeError):
-                issues.append(
-                    {"kind": "invalid_metadata", "fingerprint": str(raw.get("fingerprint") or "unknown") if isinstance(raw, dict) else "unknown"}
-                )
+def _scope_candidates(repo: Path, scope: str, prompt: str, context: dict[str, Any] | None) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    started = time.monotonic(); metrics = {"eligible":0,"scored":0,"below_threshold":0,"filtered_negative":0,"filtered_path":0,"estimated_tokens":0,"retrieval_ms":0,"index_rebuilt":0,"retrieval_degraded":False}; terms = Counter(tokenize(prompt)); prompt_phrase = normalize_phrase(prompt)
+    if not terms: return [], metrics, []
     try:
+        store = store_for(repo, scope)
         connection = _read_index(store)
         try:
-            rows = connection.execute("SELECT fingerprint,payload,summary_norm,last_used_at,miss_count_since_hit FROM entries ORDER BY fingerprint").fetchall()
-        finally:
-            connection.close()
-    except RetrievalError as exc:
-        counts = Counter(issue["kind"] for issue in issues)
-        return {"scope_path": str(store), "available": False, "counts": {"stale": 0, "duplicates": 0, "superseded": 0,
-                "orphaned_targets": 0, "invalid_metadata": counts["invalid_metadata"], "degraded": 1},
-                "issues": [*issues, {"kind": "degraded", "detail": str(exc)}]}
-    summaries: dict[str, list[str]] = {}
-    for fingerprint, payload, summary_norm, last_used, misses in rows:
-        entry = json.loads(payload)
-        summaries.setdefault(summary_norm, []).append(fingerprint)
-        target = str(entry.get("target_path") or "")
-        if target and not target.startswith("$") and not (store.parent.parent / target).exists():
-            issues.append({"kind": "orphaned_target", "fingerprint": fingerprint})
-        promoted = entry.get("promoted_at")
-        promoted_at = _parse_time(promoted)
-        if promoted_at and current - promoted_at >= timedelta(days=90) and int(misses) >= 50:
-            issues.append({"kind": "stale", "fingerprint": fingerprint})
-        if entry.get("supersedes"):
-            issues.append({"kind": "superseded", "fingerprint": str(entry["supersedes"])})
-    for group in summaries.values():
-        if len(group) > 1:
-            issues.extend({"kind": "duplicate", "fingerprint": fingerprint} for fingerprint in group)
-    counts = Counter(issue["kind"] for issue in issues)
-    return {"scope_path": str(store), "available": True, "counts": {"stale": counts["stale"], "duplicates": counts["duplicate"],
-            "superseded": counts["superseded"], "orphaned_targets": counts["orphaned_target"], "invalid_metadata": counts["invalid_metadata"]}, "issues": issues}
+            placeholders = ",".join("?" for _ in terms)
+            rows = connection.execute(f"SELECT p.fingerprint,p.term,p.tf,d.payload,d.doc_len FROM postings p JOIN documents d ON d.fingerprint=p.fingerprint WHERE p.term IN ({placeholders})", tuple(terms)).fetchall()
+            if not rows: return [], metrics, []
+            stats = dict(connection.execute(f"SELECT term,df FROM term_stats WHERE term IN ({placeholders})", tuple(terms)))
+            info = dict(connection.execute("SELECT key,value FROM meta WHERE key IN ('document_count','average_length')"))
+            count, average = int(info["document_count"]), float(info["average_length"])
+            candidates: dict[str, tuple[dict[str, Any], int, dict[str, float]]] = {}
+            for fingerprint, term, tf, payload, doc_len in rows:
+                entry, length, tfs = candidates.setdefault(str(fingerprint), (json.loads(payload), int(doc_len), {})); tfs[str(term)] = float(tf)
+            accepted: list[dict[str, Any]] = []; eligible: list[str] = []
+            for fingerprint, (entry, length, tfs) in candidates.items():
+                gate = _gate(entry, prompt_phrase, context)
+                if gate:
+                    metrics[f"filtered_{gate}"] += 1; continue
+                metrics["eligible"] += 1; eligible.append(fingerprint); score = 0.
+                for term, qtf in terms.items():
+                    if term in tfs:
+                        df, tf = int(stats[term]), tfs[term]; idf = math.log(1 + (count - df + .5) / (df + .5)); score += qtf * idf * (tf * (K1 + 1) / (tf + K1 * (1 - B + B * length / average)))
+                score += 2.0 * sum(1 for keyword in entry.get("keywords", []) if normalize_phrase(keyword) and normalize_phrase(keyword) in prompt_phrase)
+                score += _metadata_boost(entry, context)
+                if score < float(entry.get("min_score", DEFAULT_MIN_SCORE)): metrics["below_threshold"] += 1; continue
+                entry["knowledge_scope"] = scope; entry["score"] = score; entry["estimated_tokens"] = estimate_tokens(render_line(entry)); accepted.append(entry); metrics["scored"] += 1
+            return accepted, metrics, eligible
+        finally: connection.close()
+    except (RetrievalError, sqlite3.Error, OSError, ValueError, json.JSONDecodeError):
+        metrics["retrieval_degraded"] = True; return [], metrics, []
+    finally: metrics["retrieval_ms"] = int((time.monotonic()-started)*1000)
 
+def _update_usage(repo: Path, scope: str, eligible: list[str], selected: set[str]) -> None:
+    if not eligible: return
+    try:
+        connection = _read_index(store_for(repo, scope))
+        try:
+            connection.execute("BEGIN IMMEDIATE"); now = _now()
+            for fingerprint in eligible:
+                if fingerprint in selected: connection.execute("UPDATE usage SET eligible_count=eligible_count+1,hit_count=hit_count+1,last_used_at=?,miss_count_since_hit=0 WHERE fingerprint=?", (now, fingerprint))
+                else: connection.execute("UPDATE usage SET eligible_count=eligible_count+1,miss_count_since_hit=miss_count_since_hit+1 WHERE fingerprint=?", (fingerprint,))
+            connection.execute("COMMIT")
+        finally: connection.close()
+    except (RetrievalError, sqlite3.Error): pass
+
+def retrieve(repo: Path | str, prompt: str, task_context: dict[str, Any] | None = None, limits: dict[str, int] | None = None, *, error_logger: Callable[[str], None] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Public retrieval seam. It resolves both stores and owns ranking, dedupe and budget."""
+    root = Path(repo).resolve(); limits = limits or {}; max_results = min(MAX_RESULTS, int(limits.get("max_results", MAX_RESULTS))); budget = min(MAX_CONTEXT_TOKENS, int(limits.get("max_tokens", MAX_CONTEXT_TOKENS)))
+    total = {"eligible":0,"scored":0,"below_threshold":0,"filtered_negative":0,"filtered_path":0,"estimated_tokens":0,"retrieval_ms":0,"index_rebuilt":0,"retrieval_degraded":False}; per_scope: dict[str, tuple[list[dict[str, Any]], list[str]]] = {}
+    scopes = ("repository",) if (root / INDEX_NAME).is_file() else ("repository", "global")
+    for scope in scopes:
+        entries, metrics, eligible = _scope_candidates(root, scope, prompt, task_context); per_scope[scope] = (entries, eligible)
+        for key in total: total[key] = bool(total[key] or metrics[key]) if key == "retrieval_degraded" else total[key] + int(metrics[key])
+    by_fingerprint: dict[str, dict[str, Any]] = {}
+    for scope in ("global", "repository"):
+        for entry in per_scope.get(scope, ([], []))[0]: by_fingerprint[str(entry["fingerprint"])] = entry
+    by_summary: dict[str, dict[str, Any]] = {}
+    for entry in by_fingerprint.values():
+        key = normalized_summary(entry["summary"]); current = by_summary.get(key)
+        if current is None or (entry["knowledge_scope"] == "repository" and current["knowledge_scope"] != "repository") or (entry["knowledge_scope"] == current["knowledge_scope"] and str(entry.get("promoted_at") or "") > str(current.get("promoted_at") or "")): by_summary[key] = entry
+    def descending_text(value: Any) -> tuple[int, ...]:
+        return tuple(-ord(character) for character in str(value or ""))
+    ranked = sorted(by_summary.values(), key=lambda item: (-float(item["score"]), 0 if item["knowledge_scope"] == "repository" else 1, descending_text(item.get("promoted_at")), str(item["fingerprint"])))
+    selected: list[dict[str, Any]] = []
+    for entry in ranked:
+        cost = estimate_tokens(render_line(entry)); entry["estimated_tokens"] = cost
+        if len(selected) < max_results and total["estimated_tokens"] + cost <= budget: selected.append(entry); total["estimated_tokens"] += cost
+    for scope, (_, eligible) in per_scope.items(): _update_usage(root, scope, eligible, {str(item["fingerprint"]) for item in selected if item["knowledge_scope"] == scope})
+    total["injected"] = len(selected); total["repository_hits"] = sum(item["knowledge_scope"] == "repository" for item in selected); total["global_hits"] = sum(item["knowledge_scope"] == "global" for item in selected)
+    return selected, total
+
+def index_status(repo: Path | str, knowledge_scope: str = "repository") -> dict[str, Any]:
+    store = store_for(repo, knowledge_scope); result = {"schema":SCHEMA_VERSION,"document_count":0,"in_sync":False,"needs_rebuild":True,"last_successful_rebuild":None}
+    try:
+        connection = _read_index(store, readonly=True)
+        try:
+            meta = dict(connection.execute("SELECT key,value FROM meta")); result.update(schema=int(meta["schema"]), document_count=int(meta["document_count"]), in_sync=True, needs_rebuild=False, last_successful_rebuild=meta.get("last_successful_rebuild"))
+        finally: connection.close()
+    except RetrievalError: pass
+    return result
 
 def _parse_time(value: Any) -> datetime | None:
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        return None
+        result = datetime.fromisoformat(str(value).replace("Z", "+00:00")); return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError): return None
 
+def _audit_target(repo: Path, scope: str, target: str) -> Path | None:
+    if not target: return None
+    if scope == "repository": return (repo / target).resolve()
+    target = target.replace("$CODEX_HOME", str(_code_home())); return Path(os.path.expanduser(target)) if target.startswith("~") or os.path.isabs(target) else (_code_home() / target)
 
-def cleanup_session(store: Path | str) -> None:
-    """Best-effort removal of SQLite WAL sidecars at SessionEnd; main DB is retained."""
-    store = Path(store)
-    for suffix in ("-wal", "-shm"):
-        with contextlib.suppress(OSError):
-            (database_path(store).with_name(database_path(store).name + suffix)).unlink()
+def audit_scope(repo: Path | str, knowledge_scope: str = "repository", now: datetime | None = None) -> dict[str, Any]:
+    """Read-only audit; opens SQLite in mode=ro and never changes sidecars."""
+    root, store, current = Path(repo).resolve(), store_for(repo, knowledge_scope), now or datetime.now(timezone.utc); issues: list[dict[str, str]] = []
+    try: records = _records(store, knowledge_scope)
+    except RetrievalError: records = []
+    active = {str(record.get("fingerprint")) for record in records}; summaries: dict[str, list[str]] = {}
+    usage: dict[str, tuple[Any, ...]] = {}
+    try:
+        connection = _read_index(store, readonly=True)
+        try: usage = {str(row[0]): tuple(row[1:]) for row in connection.execute("SELECT fingerprint,last_used_at,miss_count_since_hit FROM usage")}
+        finally: connection.close()
+    except RetrievalError: pass
+    for record in records:
+        fingerprint = str(record.get("fingerprint") or "unknown")
+        try: validate_metadata(record)
+        except ValueError: issues.append({"kind":"invalid-metadata","fingerprint":fingerprint}); continue
+        summaries.setdefault(normalized_summary(record.get("summary")), []).append(fingerprint)
+        target = _audit_target(root, knowledge_scope, str(record.get("target_path") or ""))
+        if target and not target.exists(): issues.append({"kind":"orphaned-target","fingerprint":fingerprint})
+        last_used, misses = usage.get(fingerprint, (None, 0)); age = max((moment for moment in (_parse_time(record.get("promoted_at")), _parse_time(last_used)) if moment), default=None)
+        if age and current - age >= timedelta(days=90) and int(misses) >= 50: issues.append({"kind":"stale-review","fingerprint":fingerprint})
+        if any(item in active for item in record.get("supersedes", [])): issues.extend({"kind":"superseded-review","fingerprint":old} for old in record["supersedes"] if old in active)
+    for members in summaries.values():
+        if len(members) > 1: issues.extend({"kind":"exact-duplicate","fingerprint":fingerprint} for fingerprint in members)
+    counts = Counter(item["kind"] for item in issues)
+    return {"counts": {key: counts[key] for key in ("stale-review","exact-duplicate","superseded-review","orphaned-target","invalid-metadata")}, "issues": issues}

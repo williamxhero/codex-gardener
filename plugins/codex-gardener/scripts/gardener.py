@@ -712,7 +712,7 @@ def ensure_learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path
     root = learning_dir(repo, knowledge_scope)
     root.mkdir(parents=True, exist_ok=True)
     ignore = root / ".gitignore"
-    required = ["inbox.jsonl", "index.jsonl", "resolutions.jsonl"]
+    required = ["inbox.jsonl", "index.jsonl", "resolutions.jsonl", "retrieval.sqlite3", "retrieval.sqlite3-wal", "retrieval.sqlite3-shm", ".retrieval-rebuild-*"]
     existing = []
     if ignore.is_file():
         existing = ignore.read_text(encoding="utf-8").splitlines()
@@ -1233,7 +1233,7 @@ def update_index(repo: Path, resolution: dict[str, Any], knowledge_scope: str = 
         )
         os.replace(temp, path)
     # JSONL is committed first. The derived index is rebuilt only afterwards.
-    retrieval.sync_scope(root)
+    retrieval.sync_scope(repo, knowledge_scope)
 
 
 def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
@@ -1245,6 +1245,9 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
     reason = getattr(args, "reason", None)
     if status == "retired" and reason not in RETIRE_REASONS:
         raise ValueError("retired resolutions require --reason stale, duplicate, or superseded")
+    supersedes = getattr(args, "supersedes", None) or []
+    if isinstance(supersedes, str):
+        supersedes = [supersedes]
     metadata = retrieval.validate_metadata(
         {
             "summary": args.summary or "",
@@ -1255,8 +1258,18 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
             "platforms": getattr(args, "platform", None) or [],
             "negative_keywords": getattr(args, "negative_keyword", None) or [],
             "min_score": getattr(args, "min_score", retrieval.DEFAULT_MIN_SCORE),
-            "supersedes": getattr(args, "supersedes", None),
+            "supersedes": supersedes,
         }
+    )
+    metadata["estimated_tokens"] = retrieval.estimate_tokens(
+        retrieval.render_line(
+            {
+                "knowledge_scope": knowledge_scope,
+                "scope": getattr(args, "scope", None),
+                "summary": args.summary or "",
+                "target_path": args.target_path or "",
+            }
+        )
     )
     resolution = {
         "schema_version": SCHEMA_VERSION,
@@ -1285,58 +1298,18 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
 
 def promoted_context_result(repo: Path, prompt: str, state: dict[str, Any] | None = None) -> tuple[str | None, dict[str, Any]]:
     tool_names = list((state or {}).get("tool_names", []))[:16]
-    task_context = retrieval.derive_task_context(prompt, repo, tool_names=tool_names)
-    combined: dict[str, tuple[str, dict[str, Any]]] = {}
-    aggregate: dict[str, Any] = {"eligible": 0, "scored": 0, "filtered": 0, "threshold": 0, "token": 0,
-                                 "latency_ms": 0, "rebuild": 0, "degraded": False}
-    available = {"repository": 0, "global": 0}
-    for knowledge_scope in ("global", "repository"):
-        root = learning_dir(repo, knowledge_scope)
-        # A missing derived file is the normal migration case. Rebuild it from
-        # authoritative JSONL; an existing stale/corrupt file still fails open.
-        if (root / "index.jsonl").is_file() and not retrieval.database_path(root).is_file():
-            try:
-                retrieval.sync_scope(root)
-                aggregate["rebuild"] += 1
-            except retrieval.RetrievalError:
-                log_effectiveness("operation_error", operation="retrieval", category="storage")
-        entries, metrics = retrieval.retrieve(root, prompt, task_context=task_context, error_logger=lambda _: log_effectiveness("operation_error", operation="retrieval", category="runtime"))
-        status = retrieval.index_status(root)
-        available[knowledge_scope] = int(status.get("entries") or 0)
-        for key in aggregate:
-            if key == "degraded":
-                aggregate[key] = bool(aggregate[key] or metrics.get(key))
-            else:
-                aggregate[key] += int(metrics.get(key) or 0)
-        for entry in entries:
-            entry["knowledge_scope"] = knowledge_scope
-            summary_key = retrieval.normalized_summary(entry.get("summary"))
-            if knowledge_scope == "repository":
-                for key, (_, current) in list(combined.items()):
-                    if key == summary_key or current.get("fingerprint") == entry.get("fingerprint"):
-                        combined.pop(key)
-            combined[summary_key] = (knowledge_scope, entry)
-    selected = [value[1] for value in combined.values()]
-    selected.sort(key=lambda entry: (-float(entry.get("score") or 0), 0 if entry.get("knowledge_scope") == "repository" else 1,
-                                     str(entry.get("promoted_at") or ""), str(entry.get("fingerprint") or "")))
-    selected = selected[:retrieval.MAX_RESULTS]
+    task_context = retrieval.derive_task_context(prompt, repo, tool_names=tool_names, tool_parameters=(state or {}).get("observed_paths", []))
+    selected, metrics = retrieval.retrieve(repo, prompt, task_context, retrieval_limits := {"max_results": retrieval.MAX_RESULTS, "max_tokens": retrieval.MAX_CONTEXT_TOKENS}, error_logger=lambda _: log_effectiveness("operation_error", operation="retrieval", category="runtime"))
+    metrics["index_rebuilt"] = int(metrics.get("index_rebuilt") or 0) + int(bool((state or {}).get("index_rebuilt")))
+    available = {scope: retrieval.index_status(repo, scope).get("document_count", 0) for scope in ("repository", "global")}
     if not selected:
         return None, {"repository_available": available["repository"], "global_available": available["global"],
-                      "repository_hits": 0, "global_hits": 0, "injected": 0, **aggregate}
-    lines = ["Codex Gardener found relevant promoted knowledge:"]
-    hits = {"repository": 0, "global": 0}
-    for entry in selected:
-        hits[str(entry["knowledge_scope"])] += 1
-        lines.append(
-            f"- [{entry.get('knowledge_scope')}] {entry.get('summary')} "
-            f"(source: {entry.get('target_path')})"
-        )
+                      "repository_hits": 0, "global_hits": 0, "injected": 0, **metrics}
+    lines = ["Codex Gardener found relevant promoted knowledge:", *(retrieval.render_line(entry) for entry in selected)]
     return "\n".join(lines), {
         "repository_available": available["repository"],
         "global_available": available["global"],
-        "repository_hits": hits["repository"],
-        "global_hits": hits["global"],
-        "injected": len(selected), **aggregate,
+        **metrics,
     }
 
 
@@ -1762,13 +1735,24 @@ def handle_session_start(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     state = new_state(payload)
     save_state(path, state)
-    root_value = state.get("repo_root")
+    root_value = state.get("repo_root") or state.get("cwd")
     log_effectiveness(
         "session_start",
         session=session_identity(state.get("session_id")),
         project=project_identity(Path(str(root_value))) if root_value else None,
     )
     if root_value:
+        rebuilt = False
+        for knowledge_scope in ("repository", "global"):
+            status = retrieval.index_status(Path(str(root_value)), knowledge_scope)
+            if status["needs_rebuild"] and (retrieval.store_for(Path(str(root_value)), knowledge_scope) / "index.jsonl").is_file():
+                try:
+                    retrieval.sync_scope(Path(str(root_value)), knowledge_scope)
+                    rebuilt = True
+                except retrieval.RetrievalError:
+                    pass
+        state["index_rebuilt"] = rebuilt
+        save_state(path, state)
         count = len(pending_records(Path(root_value)))
         if count:
             emit_json(
@@ -1802,6 +1786,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
                 "test_signal": False,
                 "tool_counts": {},
                 "tool_names": [],
+                "observed_paths": [],
                 "review_requested": False,
                 "capture_completed": False,
                 "audit_requested": False,
@@ -1849,14 +1834,13 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
     name = str(payload.get("tool_name") or "unknown")
     tool_input = payload.get("tool_input")
-    fingerprint = sha256_text(name.casefold() + "\0" + json_dump(tool_input))[:24]
     counts = state.setdefault("tool_counts", {})
     tool_names = state.setdefault("tool_names", [])
     normalized_name = name.casefold()
     if normalized_name not in tool_names and len(tool_names) < 16:
         tool_names.append(normalized_name)
-    counts[fingerprint] = int(counts.get(fingerprint) or 0) + 1
-    if name.casefold() not in {"wait", "write_stdin", "functions.wait"} and counts[fingerprint] >= 2:
+    counts[normalized_name] = int(counts.get(normalized_name) or 0) + 1
+    if normalized_name not in {"wait", "write_stdin", "functions.wait"} and counts[normalized_name] >= 2:
         state["repeated_tool_signal"] = True
     if tool_failed(payload.get("tool_response")):
         state["failure_count"] = int(state.get("failure_count") or 0) + 1
@@ -1865,6 +1849,10 @@ def handle_post_tool(payload: dict[str, Any]) -> None:
         state["test_signal"] = True
     if tool_mutates(name, command):
         state["edit_signal"] = True
+    repo = Path(str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or os.getcwd()))
+    observed = set(state.get("observed_paths", []))
+    observed.update(retrieval.derive_task_context("", repo, tool_parameters=[tool_input]).get("paths", []))
+    state["observed_paths"] = sorted(observed)[:32]
     save_state(path, state)
 
 
@@ -2040,10 +2028,6 @@ def handle_stop(payload: dict[str, Any]) -> None:
 
 def handle_session_end(payload: dict[str, Any]) -> None:
     path, state = load_state(payload)
-    root_value = state.get("repo_root") or state.get("cwd")
-    if root_value:
-        for knowledge_scope in ("repository", "global"):
-            retrieval.cleanup_session(learning_dir(Path(str(root_value)), knowledge_scope))
     cwd = Path(str(state.get("cwd") or payload.get("cwd") or os.getcwd()))
     signals = signal_names(state, cwd)
     continuation_kind = str(state.get("continuation_kind") or "")
@@ -2111,7 +2095,7 @@ def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict
         report["candidate_group_status"] = group_status
         report["candidate_group_evidence_status"] = group_evidence_status
         report["retrieval_audit"] = {
-            knowledge_scope: retrieval.audit_scope(learning_dir(repo, knowledge_scope)).get("counts", {})
+            knowledge_scope: retrieval.audit_scope(repo, knowledge_scope).get("counts", {})
             for knowledge_scope in ("repository", "global")
         }
     return report
@@ -2275,7 +2259,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--platform", action="append")
     resolve.add_argument("--negative-keyword", action="append")
     resolve.add_argument("--min-score", type=float, default=retrieval.DEFAULT_MIN_SCORE)
-    resolve.add_argument("--supersedes")
+    resolve.add_argument("--supersedes", action="append")
     resolve.add_argument("--reason", choices=sorted(RETIRE_REASONS))
 
     index_status_command = sub.add_parser("index-status")
@@ -2343,11 +2327,11 @@ def main() -> int:
         elif args.command == "resolve":
             emit_json(resolve_candidate(args))
         elif args.command == "index-status":
-            emit_json(retrieval.index_status(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
+            emit_json(retrieval.index_status(Path(args.repo).resolve(), args.knowledge_scope))
         elif args.command == "index-rebuild":
-            emit_json(retrieval.sync_scope(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
+            emit_json(retrieval.sync_scope(Path(args.repo).resolve(), args.knowledge_scope))
         elif args.command == "index-audit":
-            emit_json(retrieval.audit_scope(learning_dir(Path(args.repo).resolve(), args.knowledge_scope)))
+            emit_json(retrieval.audit_scope(Path(args.repo).resolve(), args.knowledge_scope))
         elif args.command == "review-complete":
             complete_review_without_candidate(args.session_id)
             emit_json({"completed": True, "session_id": args.session_id})

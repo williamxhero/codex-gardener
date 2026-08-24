@@ -2,7 +2,7 @@
 
 ## Retrieval index
 
-Version 0.7.0 derives a local SQLite index only from the promoted `index.jsonl` record: summary, keywords, target path, approved metadata, and aggregate entry counters (`last_used_at`, hit, eligible, and miss counts). The authoritative JSONL remains separate. Prompts, tool input/output, query terms, raw paths discovered from prompts, transcripts, secrets, embeddings, and network telemetry are never persisted by retrieval. A stale, corrupt, or busy index fails open without JSON fallback.
+Version 0.7.0 derives a local SQLite index only from the promoted `index.jsonl` record: documents, postings, term statistics, approved metadata, and per-scope aggregate usage counters (`last_used_at`, hit, eligible, and miss counts). The authoritative JSONL remains separate. Hot retrieval reads neither its body nor a hash: it compares only stored `size` and `mtime_ns`. Prompts, tool input/output, query terms, raw paths discovered from prompts, transcripts, secrets, embeddings, and network telemetry are never persisted by retrieval. A missing, stale, corrupt, or busy index fails open without JSON fallback.
 
 Codex Gardener is a local Codex plugin. Its Python code makes no network requests and includes no network telemetry, remote analytics service, or credential collection. Its optional local effectiveness log lets users audit whether the plugin is useful. Codex itself may communicate with services according to your Codex configuration and OpenAI's applicable policies.
 
