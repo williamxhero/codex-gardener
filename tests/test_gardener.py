@@ -34,6 +34,8 @@ class GardenerTest(unittest.TestCase):
         self.other.mkdir()
         self.data = Path(self.temp.name) / "plugin-data"
         self.codex_home = Path(self.temp.name) / "codex-home"
+        self.transcript = Path(self.temp.name) / "trusted-transcript.jsonl"
+        self.transcript.write_text("trusted metadata only\n", encoding="utf-8")
         self.env = patch.dict(
             os.environ,
             {
@@ -51,7 +53,7 @@ class GardenerTest(unittest.TestCase):
             "session_id": "session-1",
             "turn_id": "turn-1",
             "cwd": str(self.root),
-            "transcript_path": None,
+            "transcript_path": str(self.transcript),
         }
         value.update(extra)
         return value
@@ -1300,15 +1302,141 @@ class GardenerTest(unittest.TestCase):
             ),
         )
         started = time.monotonic()
-        self.run_hook("SessionEnd", self.payload(reason="other", transcript_path="C:/private/rollout.jsonl"))
+        self.run_hook("SessionEnd", self.payload(reason="other"))
         self.assertLess(time.monotonic() - started, 3)
         pending = gardener.pending_records()
         self.assertEqual(len(pending), 1)
         rendered = json.dumps(pending)
         self.assertNotIn("secret transcript body", rendered)
-        self.assertIn("C:/private/rollout.jsonl", rendered)
+        self.assertEqual(pending[0]["transcript_path"], str(self.transcript))
+        self.assertIn("evidence_capsule", pending[0])
         gardener.resolve_pending("session-1")
         self.assertEqual(gardener.pending_records(), [])
+
+    def test_session_end_unreviewable_transcripts_are_not_queued_and_log_safe_reasons(self) -> None:
+        cases = {
+            "null": None,
+            "missing": str(Path(self.temp.name) / "missing-transcript.jsonl"),
+            "unreadable": str(self.root),
+        }
+        for name, transcript_path in cases.items():
+            with self.subTest(name=name):
+                session_id = f"unreviewable-{name}"
+                payload = self.payload(session_id=session_id, turn_id=session_id, transcript_path=transcript_path)
+                self.run_hook("SessionStart", payload)
+                self.run_hook(
+                    "PostToolUse",
+                    payload | {"tool_name": "apply_patch", "tool_input": {"patch": "private input"}, "tool_response": {}},
+                )
+                self.run_hook("SessionEnd", payload)
+                self.assertFalse(any(item["session_id"] == session_id for item in gardener.pending_records()))
+        events, _ = gardener.effectiveness.read_events(root=self.data)
+        unreviewable = [event for event in events if event["event"] == "pending_unreviewable"]
+        self.assertEqual([event["pending_reason"] for event in unreviewable], ["missing", "missing", "unreadable"])
+        self.assertNotIn("private input", json.dumps(unreviewable))
+        self.assertNotIn(str(self.root), json.dumps(unreviewable))
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["pending_unreviewable"], 3)
+        self.assertEqual(report["reviews"]["pending_unreviewable_reasons"], {"missing": 2, "unreadable": 1})
+        self.assertEqual(report["reviews"]["current_evidence_backlog"]["unreviewable"], 0)
+
+    def test_readable_pending_keeps_private_path_and_bounded_safe_capsule(self) -> None:
+        self.run_hook("SessionStart", self.payload(source="startup"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="Fix test in src/private.py"))
+        self.run_hook(
+            "PostToolUse",
+            self.payload(
+                tool_name="Bash",
+                tool_input={"command": "pytest --token private-output"},
+                tool_response={"stderr": "private tool output"},
+            ),
+        )
+        self.run_hook(
+            "PostToolUse",
+            self.payload(tool_name="apply_patch", tool_input={"patch": "private patch"}, tool_response={}),
+        )
+        self.assertEqual(self.run_hook("Stop", self.payload(stop_hook_active=False)), {"continue": True})
+        pending = gardener.pending_records()
+        self.assertEqual(len(pending), 1)
+        record = pending[0]
+        self.assertEqual(record["transcript_path"], str(self.transcript))
+        capsule = record["evidence_capsule"]
+        self.assertLessEqual(len(capsule["paths"]), 32)
+        self.assertTrue(capsule["tests_observed"])
+        rendered = json.dumps(record)
+        self.assertNotIn("private-output", rendered)
+        self.assertNotIn("private tool output", rendered)
+        events, _ = gardener.effectiveness.read_events(root=self.data)
+        self.assertNotIn(str(self.transcript), json.dumps(events))
+        self.assertNotIn("private-output", json.dumps(events))
+
+    def test_maintenance_prioritizes_readable_pending_and_summarizes_legacy_backlog(self) -> None:
+        readable = self.queue_pending("readable-priority")
+        gardener.append_jsonl(
+            gardener.pending_path(),
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "record_type": "pending",
+                "pending_id": "f" * 32,
+                "session_id": "legacy-missing",
+                "repo_root": str(self.root),
+                "transcript_path": None,
+                "signals": ["workspace_changed"],
+                "created_at": gardener.utc_now(),
+            },
+        )
+        status = self.run_cli("maintenance-status", "--limit", "2")
+        self.assertEqual(status["batch"][0]["pending_id"], readable["pending_id"])
+        self.assertNotIn("transcript_path", status["batch"][0])
+        self.assertNotIn("evidence_capsule", status["batch"][0])
+        self.assertEqual(status["evidence_backlog"]["reviewable"], 1)
+        self.assertEqual(status["evidence_backlog"]["unreviewable"], 1)
+        self.assertEqual(status["evidence_backlog"]["capsules"], {"present": 1, "legacy": 1})
+        targeted = self.run_cli("maintenance-status", "--pending-id", readable["pending_id"])
+        self.assertEqual(targeted["batch"][0]["transcript_path"], str(self.transcript))
+
+    def test_pending_prune_unreviewable_is_explicit_idempotent_concurrent_and_never_writes_knowledge(self) -> None:
+        readable = self.queue_pending("readable-kept")
+        missing_id = "e" * 32
+        gardener.append_jsonl(
+            gardener.pending_path(),
+            {
+                "schema_version": gardener.SCHEMA_VERSION,
+                "record_type": "pending",
+                "pending_id": missing_id,
+                "session_id": "missing-prune",
+                "repo_root": str(self.root),
+                "transcript_path": None,
+                "signals": ["workspace_changed"],
+                "created_at": gardener.utc_now(),
+            },
+        )
+        rejected = subprocess.run(
+            [sys.executable, str(SCRIPT), "pending-prune-unreviewable"],
+            cwd=self.root,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requires --confirm", rejected.stderr)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: gardener.prune_unreviewable_pending(), range(2)))
+        self.assertEqual(sum(result["terminalized"] for result in results), 1)
+        self.assertIn(missing_id, [item for result in results for item in result["pending_ids"]])
+        self.assertEqual(gardener.pending_records()[0]["pending_id"], readable["pending_id"])
+        self.assertEqual(gardener.prune_unreviewable_pending(), {"terminalized": 0, "pending_ids": []})
+        self.assertEqual(
+            self.run_cli("pending-prune-unreviewable", "--confirm"),
+            {"terminalized": 0, "pending_ids": []},
+        )
+        self.assertFalse((self.root / ".codex" / "learning" / "inbox.jsonl").exists())
+        self.assertFalse((self.root / ".codex" / "learning" / "resolutions.jsonl").exists())
+        report = gardener.effectiveness_report(14, self.root)
+        self.assertEqual(report["reviews"]["maintenance_terminal_outcomes"], 1)
+        self.assertEqual(report["reviews"]["maintenance_candidates"], 0)
+        self.assertEqual(report["reviews"]["maintenance_yield_rate"], 0.0)
 
     def test_new_user_turn_resets_review_state(self) -> None:
         self.run_hook("SessionStart", self.payload(source="startup"))
@@ -2083,7 +2211,105 @@ class GardenerTest(unittest.TestCase):
         payload = self.payload(prompt="parser")
         self.run_hook("SessionStart", payload)
         output = self.run_hook("UserPromptSubmit", payload)
-        self.assertEqual(output["hookSpecificOutput"]["additionalContextLimit"], 600)
+        self.assertEqual(
+            output["hookSpecificOutput"]["additionalContextLimit"],
+            gardener.retrieval.MAX_CONTEXT_TOKENS,
+        )
+
+    def test_session_start_cold_repair_is_bounded_and_reports_rebuild_once(self) -> None:
+        store = self.root / ".codex" / "learning"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "index.jsonl").write_text(
+            json.dumps({"fingerprint": "abc123", "summary": "Parser guidance.", "target_path": "AGENTS.md"})
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(gardener.retrieval, "COLD_REPAIR_MAX_INDEX_BYTES", 1):
+            self.run_hook("SessionStart", self.payload(source="startup"))
+        state = gardener.load_json_file(gardener.state_path("session-1"), {})
+        self.assertFalse(state["index_rebuilt"])
+        self.assertFalse((store / "retrieval.sqlite3").exists())
+
+        gardener.retrieval.sync_scope(self.root)
+        state["index_rebuilt"] = True
+        gardener.save_state(gardener.state_path("session-1"), state)
+        self.run_hook("UserPromptSubmit", self.payload(prompt="parser"))
+        self.run_hook("UserPromptSubmit", self.payload(prompt="parser", turn_id="turn-2"))
+        events, _ = gardener.effectiveness.read_events(root=self.data)
+        lookups = [event for event in events if event["event"] == "context_lookup"]
+        self.assertEqual([event["index_rebuilt"] for event in lookups], [1, 0])
+
+    def test_cold_repair_does_not_replace_a_healthy_database_when_budget_is_exhausted(self) -> None:
+        store = self.root / ".codex" / "learning"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "index.jsonl").write_text(
+            json.dumps({"fingerprint": "abc123", "summary": "Parser guidance.", "target_path": "AGENTS.md"})
+            + "\n",
+            encoding="utf-8",
+        )
+        gardener.retrieval.sync_scope(self.root)
+        before = (store / "retrieval.sqlite3").read_bytes()
+        self.assertFalse(
+            gardener.retrieval.cold_repair_scope(
+                self.root,
+                deadline=time.monotonic() - 1,
+            )
+        )
+        self.assertEqual(before, (store / "retrieval.sqlite3").read_bytes())
+
+    def test_effectiveness_json_includes_live_retrieval_audit_counts(self) -> None:
+        store = self.root / ".codex" / "learning"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "index.jsonl").write_text("not-json\n", encoding="utf-8")
+        report = self.run_cli("effectiveness", "--repo", str(self.root), "--json")
+        self.assertEqual(report["retrieval_audit"]["repository"]["invalid-metadata"], 1)
+        self.assertEqual(report["retrieval_audit"]["global"]["invalid-metadata"], 0)
+
+    def test_promoted_index_metadata_is_derived_and_repository_targets_cannot_escape(self) -> None:
+        promoted = self.run_cli(
+            "resolve",
+            "--repo",
+            str(self.root),
+            "--fingerprint",
+            "abc123",
+            "--status",
+            "promoted",
+            "--summary",
+            "Use parser guidance.",
+            "--target-path",
+            "docs/parser.md",
+            "--supersedes",
+            "deadbeef",
+        )
+        index = gardener.read_jsonl(self.root / ".codex" / "learning" / "index.jsonl")
+        self.assertEqual(index[0]["supersedes"], ["deadbeef"])
+        self.assertEqual(
+            index[0]["estimated_tokens"],
+            gardener.retrieval.estimate_tokens(gardener.retrieval.render_line(index[0])),
+        )
+        self.assertEqual(promoted["status"], "promoted")
+        escaping = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "resolve",
+                "--repo",
+                str(self.root),
+                "--fingerprint",
+                "escape1",
+                "--status",
+                "promoted",
+                "--summary",
+                "Invalid target.",
+                "--target-path",
+                "../outside.md",
+            ],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+        self.assertNotEqual(escaping.returncode, 0)
+        self.assertNotIn("sqlite", escaping.stderr.casefold())
 
     def test_effectiveness_counts_effective_resolution_statuses(self) -> None:
         promoted = gardener.record_candidate(self.candidate_args(session_id="promoted-session"))

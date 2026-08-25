@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,8 @@ DEFAULT_AUDIT_THRESHOLD = 10
 DEFAULT_AUDIT_MAX_DAYS = 7
 DEFAULT_MAINTENANCE_BATCH = 3
 PENDING_CLAIM_TTL_SECONDS = 60 * 60
+MAX_PENDING_FAILURE_COUNT = 16
+MAX_PENDING_TOOL_COUNT = 32
 SCHEDULED_AUDIT_MARKER = "[codex-gardener:scheduled-audit]"
 SCHEDULED_AUDIT_CHECK_MARKER = "[codex-gardener:scheduled-audit-check]"
 SCHEDULED_MAINTENANCE_MARKER = "[codex-gardener:scheduled-maintenance]"
@@ -712,7 +715,18 @@ def ensure_learning_dir(repo: Path, knowledge_scope: str = "repository") -> Path
     root = learning_dir(repo, knowledge_scope)
     root.mkdir(parents=True, exist_ok=True)
     ignore = root / ".gitignore"
-    required = ["inbox.jsonl", "index.jsonl", "resolutions.jsonl", "retrieval.sqlite3", "retrieval.sqlite3-wal", "retrieval.sqlite3-shm", ".retrieval-rebuild-*"]
+    required = [
+        "inbox.jsonl",
+        "index.jsonl",
+        "resolutions.jsonl",
+        "retrieval.sqlite3",
+        "retrieval.sqlite3-wal",
+        "retrieval.sqlite3-shm",
+        ".retrieval-rebuild-*",
+        f"{DEFERRED_CAPTURE_DIR}/",
+        f"{DEFERRED_AUDIT_DIR}/",
+        f"{DEFERRED_MAINTENANCE_DIR}/",
+    ]
     existing = []
     if ignore.is_file():
         existing = ignore.read_text(encoding="utf-8").splitlines()
@@ -1243,6 +1257,14 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
     knowledge_scope = normalize_knowledge_scope(getattr(args, "knowledge_scope", "repository"))
     status = args.status
     reason = getattr(args, "reason", None)
+    summary = (args.summary or "").strip()
+    target_path = (args.target_path or "").strip()
+    if status == "promoted" and (not summary or not target_path):
+        raise ValueError("promoted resolutions require --summary and --target-path")
+    if knowledge_scope == "repository" and target_path:
+        normalized_target = target_path.replace("\\", "/")
+        if normalized_target.startswith("/") or re.match(r"^[A-Za-z]:/", normalized_target) or ".." in normalized_target.split("/"):
+            raise ValueError("repository target paths must stay relative to the repository")
     if status == "retired" and reason not in RETIRE_REASONS:
         raise ValueError("retired resolutions require --reason stale, duplicate, or superseded")
     supersedes = getattr(args, "supersedes", None) or []
@@ -1250,7 +1272,7 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
         supersedes = [supersedes]
     metadata = retrieval.validate_metadata(
         {
-            "summary": args.summary or "",
+            "summary": summary,
             "task_types": getattr(args, "task_type", None) or [],
             "path_globs": getattr(args, "path_glob", None) or [],
             "languages": getattr(args, "language", None) or [],
@@ -1266,8 +1288,8 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "knowledge_scope": knowledge_scope,
                 "scope": getattr(args, "scope", None),
-                "summary": args.summary or "",
-                "target_path": args.target_path or "",
+                "summary": summary,
+                "target_path": target_path,
             }
         )
     )
@@ -1276,9 +1298,9 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
         "fingerprint": args.fingerprint,
         "knowledge_scope": knowledge_scope,
         "status": status,
-        "summary": (args.summary or "").strip(),
+        "summary": summary,
         "keywords": sorted(set(args.keyword or [])),
-        "target_path": (args.target_path or "").strip(),
+        "target_path": target_path,
         "created_at": utc_now(),
         "reason": reason,
         "metadata": metadata,
@@ -1299,13 +1321,29 @@ def resolve_candidate(args: argparse.Namespace) -> dict[str, Any]:
 def promoted_context_result(repo: Path, prompt: str, state: dict[str, Any] | None = None) -> tuple[str | None, dict[str, Any]]:
     tool_names = list((state or {}).get("tool_names", []))[:16]
     task_context = retrieval.derive_task_context(prompt, repo, tool_names=tool_names, tool_parameters=(state or {}).get("observed_paths", []))
-    selected, metrics = retrieval.retrieve(repo, prompt, task_context, retrieval_limits := {"max_results": retrieval.MAX_RESULTS, "max_tokens": retrieval.MAX_CONTEXT_TOKENS}, error_logger=lambda _: log_effectiveness("operation_error", operation="retrieval", category="runtime"))
+    retrieval_limits = {
+        "max_results": retrieval.MAX_RESULTS,
+        "max_tokens": retrieval.MAX_CONTEXT_TOKENS,
+    }
+    selected, metrics = retrieval.retrieve(
+        repo,
+        prompt,
+        task_context,
+        retrieval_limits,
+        error_logger=lambda _: log_effectiveness("operation_error", operation="retrieval", category="runtime"),
+    )
     metrics["index_rebuilt"] = int(metrics.get("index_rebuilt") or 0) + int(bool((state or {}).get("index_rebuilt")))
     available = {scope: retrieval.index_status(repo, scope).get("document_count", 0) for scope in ("repository", "global")}
     if not selected:
-        return None, {"repository_available": available["repository"], "global_available": available["global"],
-                      "repository_hits": 0, "global_hits": 0, "injected": 0, **metrics}
-    lines = ["Codex Gardener found relevant promoted knowledge:", *(retrieval.render_line(entry) for entry in selected)]
+        return None, {
+            "repository_available": available["repository"],
+            "global_available": available["global"],
+            "repository_hits": 0,
+            "global_hits": 0,
+            "injected": 0,
+            **metrics,
+        }
+    lines = [retrieval.CONTEXT_HEADING, *(retrieval.render_line(entry) for entry in selected)]
     return "\n".join(lines), {
         "repository_available": available["repository"],
         "global_available": available["global"],
@@ -1332,6 +1370,83 @@ def pending_identity(record: dict[str, Any]) -> str:
     return sha256_text(f"legacy-pending\0{session_id}\0{project}\0{created_at}")[:32]
 
 
+def trusted_transcript_path(value: Any) -> tuple[str | None, str | None]:
+    """Accept only trusted hook metadata that names a regular readable file now."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 4096:
+        return None, "missing"
+    raw = value.strip()
+    try:
+        path = Path(raw)
+        details = path.stat()
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, ValueError):
+        return None, "unreadable"
+    if not stat.S_ISREG(details.st_mode):
+        return None, "unreadable"
+    try:
+        with path.open("rb") as handle:
+            handle.read(1)
+    except OSError:
+        return None, "unreadable"
+    return raw, None
+
+
+def pending_evidence_status(record: dict[str, Any]) -> str:
+    _, reason = trusted_transcript_path(record.get("transcript_path"))
+    return "readable" if reason is None else reason
+
+
+def pending_evidence_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    status = defaultdict(int)
+    capsules = defaultdict(int)
+    for record in records:
+        status[pending_evidence_status(record)] += 1
+        capsules["present" if isinstance(record.get("evidence_capsule"), dict) else "legacy"] += 1
+    return {
+        "reviewable": status["readable"],
+        "unreviewable": status["missing"] + status["unreadable"],
+        "reasons": {name: status[name] for name in ("missing", "unreadable")},
+        "capsules": {name: capsules[name] for name in ("present", "legacy")},
+    }
+
+
+def pending_priority(record: dict[str, Any]) -> tuple[int, str, str]:
+    status = pending_evidence_status(record)
+    # Keep legacy/missing work visible, but spend bounded maintenance capacity on
+    # records whose private transcript can still be inspected first.
+    rank = {"readable": 0, "missing": 1, "unreadable": 2}[status]
+    return rank, str(record.get("created_at") or ""), str(record.get("pending_id") or "")
+
+
+def pending_evidence_capsule(state: dict[str, Any], repo_value: str) -> dict[str, Any]:
+    repo = Path(repo_value) if repo_value else None
+    context = retrieval.derive_task_context(
+        "",
+        repo,
+        tool_names=list(state.get("tool_names") or [])[:16],
+        tool_parameters=list(state.get("observed_paths") or [])[:retrieval.MAX_PATHS],
+    )
+    tool_counts = state.get("tool_counts")
+    total_tool_count = sum(
+        max(0, int(value or 0))
+        for value in (tool_counts.values() if isinstance(tool_counts, dict) else [])
+    )
+    return {
+        "signals": safe_signal_categories(state),
+        "workspace_changed": bool(state.get("edit_signal")),
+        "tests_observed": bool(state.get("test_signal")),
+        "failure_count": min(MAX_PENDING_FAILURE_COUNT, max(0, int(state.get("failure_count") or 0))),
+        "repeated_tool_workflow": bool(state.get("repeated_tool_signal")),
+        "tool_count": min(MAX_PENDING_TOOL_COUNT, total_tool_count),
+        "task_types": context["task_types"][:16],
+        "languages": context["languages"][:16],
+        "tools": context["tools"][:16],
+        "platforms": context["platforms"][:16],
+        "paths": context["paths"][:retrieval.MAX_PATHS],
+    }
+
+
 def valid_pending_record(record: dict[str, Any]) -> bool:
     if record.get("record_type", "pending") != "pending":
         return False
@@ -1349,10 +1464,10 @@ def valid_pending_record(record: dict[str, Any]) -> bool:
 
 
 def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    resolved_ids = {
+    terminal_ids = {
         str(record.get("pending_id"))
         for record in records
-        if record.get("record_type") == "resolved" and record.get("pending_id")
+        if record.get("record_type") in {"resolved", "terminal"} and record.get("pending_id")
     }
     legacy_resolved_sessions = {
         str(record.get("session_id"))
@@ -1374,7 +1489,7 @@ def active_pending_records(records: list[dict[str, Any]]) -> list[dict[str, Any]
             local_path_identity(raw.get("repo_root") or raw.get("cwd")),
         )
         if (
-            pending_id in resolved_ids
+            pending_id in terminal_ids
             or session_id in legacy_resolved_sessions
             or pending_id in seen
             or source in seen_sources
@@ -1440,7 +1555,10 @@ def claim_pending_records(
         active = active_pending_records(records)
         claims = active_pending_claims(records)
         selected = [record for record in active if claims.get(record["pending_id"]) == owner]
-        available = [record for record in active if record["pending_id"] not in claims]
+        available = sorted(
+            (record for record in active if record["pending_id"] not in claims),
+            key=pending_priority,
+        )
         selected.extend(available[: max(0, limit - len(selected))])
         selected = selected[:limit]
         new_claims = [record for record in selected if record["pending_id"] not in claims]
@@ -1473,36 +1591,60 @@ def maintenance_status(
     if not 1 <= limit <= 10:
         raise ValueError("maintenance batch limit must be between 1 and 10")
     pending = pending_records()
+    ordered = sorted(pending, key=pending_priority)
     if pending_ids:
         if len(pending_ids) > DEFAULT_MAINTENANCE_BATCH or any(
             not re.fullmatch(r"[0-9a-f]{32}", value) for value in pending_ids
         ):
             raise ValueError("maintenance status accepts at most three valid pending IDs")
         requested = set(pending_ids)
-        batch = [record for record in pending if record["pending_id"] in requested]
+        batch = [record for record in ordered if record["pending_id"] in requested]
     else:
-        batch = pending[:limit]
+        batch = ordered[:limit]
+    # The existing targeted maintenance contract retains trusted source metadata.
+    # The new capsule is intentionally only summarized here, never rendered.
+    visible_batch = []
+    for record in batch:
+        visible = dict(record)
+        visible.pop("evidence_capsule", None)
+        visible["evidence_status"] = pending_evidence_status(record)
+        if not pending_ids:
+            visible.pop("transcript_path", None)
+        visible_batch.append(visible)
     return {
         "pending_count": len(pending),
         "batch_limit": limit,
-        "batch": batch,
+        "batch": visible_batch,
+        "evidence_backlog": pending_evidence_summary(pending),
         "audit": audit_status(initialize=True),
     }
 
 
-def queue_pending_review(state: dict[str, Any], payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def queue_pending_review(state: dict[str, Any], payload: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
     session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")[:256]
     repo_value = str(state.get("repo_root") or state.get("cwd") or payload.get("cwd") or "")[:4096]
     pending_id = sha256_text(f"pending\0{session_id}\0{repo_value.casefold()}")[:32]
-    transcript_value = str(payload.get("transcript_path") or "")
+    transcript_value, unreviewable_reason = trusted_transcript_path(payload.get("transcript_path"))
+    if unreviewable_reason is not None:
+        if state.get("pending_unreviewable_reason") != unreviewable_reason:
+            log_effectiveness(
+                "pending_unreviewable",
+                session=session_identity(session_id),
+                project=project_identity(Path(repo_value)) if repo_value else None,
+                pending_reason=unreviewable_reason,
+            )
+        state["pending_unreviewable_reason"] = unreviewable_reason
+        return None, False
+    state.pop("pending_unreviewable_reason", None)
     record = {
         "schema_version": SCHEMA_VERSION,
         "record_type": "pending",
         "pending_id": pending_id,
         "session_id": session_id,
         "repo_root": repo_value or None,
-        "transcript_path": transcript_value[:4096] or None,
+        "transcript_path": transcript_value,
         "signals": safe_signal_categories(state),
+        "evidence_capsule": pending_evidence_capsule(state, repo_value),
         "run_kind": effectiveness.current_run_kind(),
         "created_at": utc_now(),
     }
@@ -1559,6 +1701,53 @@ def resolve_pending_record(record: dict[str, Any]) -> bool:
         project=project,
     )
     return True
+
+
+def prune_unreviewable_pending() -> dict[str, Any]:
+    """Explicitly terminalize only active records whose private evidence is gone."""
+    path = pending_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    terminalized: list[tuple[dict[str, Any], str]] = []
+    with file_lock(path):
+        records = read_jsonl(path)
+        for record in active_pending_records(records):
+            reason = pending_evidence_status(record)
+            if reason not in {"missing", "unreadable"}:
+                continue
+            terminalized.append((record, reason))
+        if terminalized:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                for record, reason in terminalized:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "schema_version": SCHEMA_VERSION,
+                                "record_type": "terminal",
+                                "pending_id": record["pending_id"],
+                                "outcome": "unreviewable",
+                                "reason": reason,
+                                "created_at": utc_now(),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+    for record, reason in terminalized:
+        raw_project = record.get("repo_root") or record.get("cwd")
+        log_effectiveness(
+            "pending_terminal_unreviewable",
+            session=session_identity(record.get("session_id")),
+            project=project_identity(Path(str(raw_project))) if raw_project else None,
+            pending_reason=reason,
+            run_kind=str(record.get("run_kind") or effectiveness.current_run_kind()),
+        )
+    return {
+        "terminalized": len(terminalized),
+        "pending_ids": [record["pending_id"] for record, _ in terminalized],
+    }
 
 
 def resolve_pending(session_id: str) -> None:
@@ -1700,6 +1889,14 @@ def consume_deferred_pending_outcomes(
                 project=project_identity(source_repo),
                 run_kind=str(pending.get("run_kind") or effectiveness.current_run_kind()),
             )
+        log_effectiveness(
+            "pending_terminal_candidate"
+            if marker["outcome"] == "candidate"
+            else "pending_terminal_no_candidate",
+            session=session_identity(pending.get("session_id")),
+            project=project_identity(source_repo),
+            run_kind=str(pending.get("run_kind") or effectiveness.current_run_kind()),
+        )
         with contextlib.suppress(OSError):
             marker_path.unlink()
         processed += 1
@@ -1745,12 +1942,8 @@ def handle_session_start(payload: dict[str, Any]) -> None:
         rebuilt = False
         for knowledge_scope in ("repository", "global"):
             status = retrieval.index_status(Path(str(root_value)), knowledge_scope)
-            if status["needs_rebuild"] and (retrieval.store_for(Path(str(root_value)), knowledge_scope) / "index.jsonl").is_file():
-                try:
-                    retrieval.sync_scope(Path(str(root_value)), knowledge_scope)
-                    rebuilt = True
-                except retrieval.RetrievalError:
-                    pass
+            if status["needs_rebuild"]:
+                rebuilt = retrieval.cold_repair_scope(Path(str(root_value)), knowledge_scope) or rebuilt
         state["index_rebuilt"] = rebuilt
         save_state(path, state)
         count = len(pending_records(Path(root_value)))
@@ -1818,13 +2011,16 @@ def handle_user_prompt(payload: dict[str, Any]) -> None:
         project=project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None,
         **metrics,
     )
+    if state.get("index_rebuilt"):
+        state["index_rebuilt"] = False
+        save_state(path, state)
     if context:
         emit_json(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": context,
-                    "additionalContextLimit": 600,
+                    "additionalContextLimit": retrieval.MAX_CONTEXT_TOKENS,
                 }
             }
         )
@@ -1942,6 +2138,10 @@ def handle_stop(payload: dict[str, Any]) -> None:
             save_state(path, state)
             emit_json({"continue": True})
             return
+        if pending is None:
+            save_state(path, state)
+            emit_json({"continue": True})
+            return
         state["review_requested"] = True
         state["pending_id"] = pending["pending_id"]
         save_state(path, state)
@@ -2044,9 +2244,10 @@ def handle_session_end(payload: dict[str, Any]) -> None:
         except (OSError, TimeoutError):
             log_effectiveness("operation_error", operation="pending", category="storage")
         else:
-            state["review_requested"] = True
-            state["pending_id"] = pending["pending_id"]
-            if created:
+            if pending is not None:
+                state["review_requested"] = True
+                state["pending_id"] = pending["pending_id"]
+            if created and pending is not None:
                 session_id = str(payload.get("session_id") or state.get("session_id") or "unknown")
                 project = project_identity(Path(str(state["repo_root"]))) if state.get("repo_root") else None
                 common = {
@@ -2080,7 +2281,9 @@ def effectiveness_report(since_days: int = 14, repo: Path | None = None) -> dict
     report = effectiveness.summarize(since_days=since_days)
     report["health"].update(plugin_health())
     report["health"]["audit"] = audit_status(initialize=True)
-    report["reviews"]["current_pending"] = len(pending_records(repo))
+    pending = pending_records(repo)
+    report["reviews"]["current_pending"] = len(pending)
+    report["reviews"]["current_evidence_backlog"] = pending_evidence_summary(pending)
     if repo is not None:
         group_status: dict[str, dict[str, int]] = {}
         group_evidence_status: dict[str, dict[str, int]] = {}
@@ -2170,7 +2373,10 @@ def format_effectiveness_report(report: dict[str, Any]) -> str:
             f"{reviews['requested']} requested, {reviews['captures_recorded']} captured, "
             f"{reviews['candidates_per_requested_review']:.2f} candidates/request, "
             f"{reviews['completed_without_candidate']} completed without candidate, "
-            f"{reviews['current_pending']} currently pending"
+            f"{reviews['current_pending']} currently pending "
+            f"({reviews['current_evidence_backlog']['reviewable']} reviewable, "
+            f"{reviews['current_evidence_backlog']['unreviewable']} unreviewable); "
+            f"maintenance yield={reviews['maintenance_yield_rate']:.2%}"
         ),
         (
             "Context: "
@@ -2283,6 +2489,13 @@ def build_parser() -> argparse.ArgumentParser:
     pending_resolve = sub.add_parser("pending-resolve")
     pending_resolve.add_argument("--session-id", required=True)
 
+    pending_prune = sub.add_parser("pending-prune-unreviewable")
+    pending_prune.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required acknowledgement that only active unreviewable pending records will be terminalized.",
+    )
+
     report = sub.add_parser("effectiveness")
     report.add_argument("--since-days", type=int, default=14)
     report.add_argument("--repo")
@@ -2341,6 +2554,10 @@ def main() -> int:
         elif args.command == "pending-resolve":
             resolve_pending(args.session_id)
             emit_json({"resolved": True, "session_id": args.session_id})
+        elif args.command == "pending-prune-unreviewable":
+            if not args.confirm:
+                raise ValueError("pending-prune-unreviewable requires --confirm")
+            emit_json(prune_unreviewable_pending())
         elif args.command == "effectiveness":
             repo = Path(args.repo).resolve() if args.repo else None
             report = effectiveness_report(args.since_days, repo)
@@ -2353,7 +2570,7 @@ def main() -> int:
         elif args.command == "maintenance-status":
             emit_json(maintenance_status(args.limit, args.pending_id))
         return 0
-    except (OSError, ValueError, TimeoutError) as exc:
+    except (OSError, ValueError, TimeoutError, retrieval.RetrievalError) as exc:
         sys.stderr.write(f"codex-gardener: {exc}\n")
         return 1
 

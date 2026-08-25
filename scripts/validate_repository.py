@@ -172,6 +172,10 @@ def validate_hygiene() -> None:
         "Sandbox-safe deferred maintenance outcome CLI is missing",
     )
     require('sub.add_parser("maintenance-status")' in gardener_source, "Bounded maintenance status CLI is missing")
+    require(
+        'sub.add_parser("pending-prune-unreviewable")' in gardener_source,
+        "Explicit unreviewable pending cleanup CLI is missing",
+    )
     for command in ("index-status", "index-rebuild", "index-audit"):
         require(f'sub.add_parser("{command}")' in gardener_source, f"Retrieval {command} CLI is missing")
     require("additionalContextLimit" in gardener_source, "UserPromptSubmit retrieval context must be bounded")
@@ -181,6 +185,8 @@ def validate_hygiene() -> None:
     require("CODEX_GARDENER_AUDIT_THRESHOLD" in gardener_source, "Knowledge audit review threshold is missing")
     require("CODEX_GARDENER_AUDIT_MAX_DAYS" in gardener_source, "Knowledge audit time threshold is missing")
     require("CODEX_GARDENER_RUN_KIND" in effectiveness_source, "Effectiveness run-kind classification is missing")
+    require("pending_unreviewable" in effectiveness_source, "Pending evidence availability events are missing")
+    require("maintenance_yield_rate" in effectiveness_source, "Maintenance yield metric is missing")
     require('"evidence_status"' in gardener_source, "Candidate evidence maturity metadata is missing")
     require(
         '"candidate_group_evidence_status"' in gardener_source,

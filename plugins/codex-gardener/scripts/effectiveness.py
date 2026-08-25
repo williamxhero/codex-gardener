@@ -59,6 +59,10 @@ EVENT_FIELDS: dict[str, set[str]] = {
     "audit_completed": {"session", "project", "audit_reason", "run_kind"},
     "pending_queued": {"session", "project", "signals"},
     "pending_resolved": {"session", "project"},
+    "pending_unreviewable": {"session", "project", "pending_reason"},
+    "pending_terminal_candidate": {"session", "project", "run_kind"},
+    "pending_terminal_no_candidate": {"session", "project", "run_kind"},
+    "pending_terminal_unreviewable": {"session", "project", "pending_reason", "run_kind"},
     "resolution_recorded": {"project", "knowledge_scope", "status", "target"},
     "project_boundary_denied": {"session", "primary_project", "target_project", "tool_category"},
     "operation_error": {"operation", "category"},
@@ -75,6 +79,7 @@ ENUM_VALUES = {
     "category": {"input", "storage", "runtime"},
     "run_kind": {"real", "smoke"},
     "audit_reason": {"review_threshold", "elapsed_time", "forced", "scheduled"},
+    "pending_reason": {"missing", "unreadable"},
 }
 SIGNALS = {"workspace_changed", "user_correction", "repeated_failures", "repeated_tool_workflow"}
 HASH_FIELDS = {"session", "project", "primary_project", "target_project"}
@@ -358,6 +363,13 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
     lookups = [item for item in events if item["event"] == "context_lookup"]
     lookups_with_hits = sum(1 for item in lookups if int(item.get("injected") or 0) > 0)
     boundary = [item for item in events if item["event"] == "project_boundary_denied"]
+    pending_unreviewable = [item for item in events if item["event"] == "pending_unreviewable"]
+    maintenance_terminal = [
+        item
+        for item in events
+        if item["event"]
+        in {"pending_terminal_candidate", "pending_terminal_no_candidate", "pending_terminal_unreviewable"}
+    ]
     audits = [item for item in events if item["event"] in {"audit_requested", "audit_completed"}]
     latencies = [int(item.get("retrieval_ms", item.get("latency_ms", 0)) or 0) for item in lookups]
     injected_tokens = [int(item.get("estimated_tokens", item.get("token", 0)) or 0) for item in lookups]
@@ -395,6 +407,15 @@ def summarize(*, since_days: int = 14, root: Path | None = None, now: datetime |
             "completed_without_candidate": by_type["review_completed_no_candidate"],
             "pending_queued": by_type["pending_queued"],
             "pending_resolved": by_type["pending_resolved"],
+            "pending_unreviewable": len(pending_unreviewable),
+            "pending_unreviewable_reasons": dict(
+                sorted(Counter(str(item.get("pending_reason")) for item in pending_unreviewable).items())
+            ),
+            "maintenance_terminal_outcomes": len(maintenance_terminal),
+            "maintenance_candidates": by_type["pending_terminal_candidate"],
+            "maintenance_yield_rate": _rate(
+                by_type["pending_terminal_candidate"], len(maintenance_terminal)
+            ),
         },
         "audits": {
             "requested": by_type["audit_requested"],

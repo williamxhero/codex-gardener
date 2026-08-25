@@ -48,6 +48,8 @@ class WindowsHookCommandTest(unittest.TestCase):
             shutil.copytree(PLUGIN / "scripts", scripts)
             workspace = root / "workspace"
             workspace.mkdir()
+            transcript = root / "trusted-transcript.jsonl"
+            transcript.write_text("trusted metadata only\n", encoding="utf-8")
             env = os.environ.copy()
             env.pop("CODEX_GARDENER_DATA", None)
             env.pop("PYTHONIOENCODING", None)
@@ -64,6 +66,7 @@ class WindowsHookCommandTest(unittest.TestCase):
                 "session_id": "utf8-correction-session",
                 "turn_id": "utf8-correction-turn",
                 "cwd": str(workspace),
+                "transcript_path": str(transcript),
             }
 
             def invoke(event: str, payload: dict[str, object]) -> subprocess.CompletedProcess[bytes]:

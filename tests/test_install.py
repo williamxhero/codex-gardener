@@ -92,6 +92,25 @@ class InstallTest(unittest.TestCase):
         self.assertIn("run /hooks", output)
         self.assertIn("new task", output)
 
+    def test_existing_061_plugin_upgrades_in_an_isolated_codex_home(self) -> None:
+        runner = FakeRunner(
+            marketplaces=[{"name": "codex-gardener", "root": str(installer.REPO_ROOT)}],
+            installed=[
+                {
+                    "pluginId": "codex-gardener@codex-gardener",
+                    "version": "0.6.1",
+                    "installed": True,
+                    "enabled": True,
+                }
+            ],
+        )
+        code, output, error = self.run_main(runner)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(runner.commands[-1][1:], ["plugin", "add", "codex-gardener@codex-gardener"])
+        index = Path(os.environ["CODEX_HOME"]) / "codex-gardener-global-learning" / "retrieval.sqlite3"
+        self.assertTrue(index.is_file())
+        self.assertIn("Rebuilt local global retrieval index (0 entries)", output)
+
     def test_existing_matching_marketplace_skips_marketplace_add(self) -> None:
         runner = FakeRunner([{"name": "codex-gardener", "root": str(installer.REPO_ROOT)}])
         code, output, error = self.run_main(runner)
